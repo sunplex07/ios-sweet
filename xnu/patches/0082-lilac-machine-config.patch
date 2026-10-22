@@ -12,33 +12,58 @@ index f2d8bf8..75ab7cf 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 1981490..c87d15a 100644
+index 1981490..faecc9b 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -54,6 +54,10 @@ sp_find_apid(unsigned ppid)
+@@ -12,6 +12,12 @@
+ #include <IOKit/IOLocks.h>
+ #include "sweet_spmi.h"
+ 
++#if defined(ARM64_BOARD_CONFIG_LILAC)
++#define SWEET_SPMI_HW 0
++#else
++#define SWEET_SPMI_HW 1
++#endif
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define SP_CORE_PA 0x0c440000u
+@@ -54,6 +60,10 @@ sp_find_apid(unsigned ppid)
  int
  sweet_spmi_init(void)
  {
-+#if defined(ARM64_BOARD_CONFIG_LILAC)
-+	/* SM7150 SPMI arbiter addresses; not valid on MSM8998. */
-+	return -1;
-+#endif
++	if (!SWEET_SPMI_HW) {
++		/* SM7150 SPMI arbiter addresses; not valid on MSM8998. */
++		return -1;
++	}
  	if (sp_attempted) {
  		return sp_ready ? 0 : -1;
  	}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 6b926fe..c5654fa 100644
+index 6b926fe..ab150b7 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -811,6 +811,11 @@ int sweet_ufs_rootdev(dev_t *dev);
+@@ -25,6 +25,12 @@
+ #include <sys/conf.h>
+ #include <sys/disk.h>
+ #include <sys/errno.h>
++
++#if defined(ARM64_BOARD_CONFIG_LILAC)
++#define SWEET_UFS_HW 0
++#else
++#define SWEET_UFS_HW 1
++#endif
+ #include <sys/proc.h>
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+@@ -811,6 +817,10 @@ int sweet_ufs_rootdev(dev_t *dev);
  int
  sweet_ufs_rootdev(dev_t *dev)
  {
-+#if defined(ARM64_BOARD_CONFIG_LILAC)
-+	/* SM7150 UFS HCI programming; lilac has a different UFS controller. */
-+	(void)dev;
-+	return ENODEV;
-+#endif
++	if (!SWEET_UFS_HW) {
++		/* SM7150 UFS HCI map; lilac has a different UFS controller. */
++		return ENODEV;
++	}
  	if (!su.ready) {
  		int error = sweet_ufs_init();
  		if (error) {
@@ -282,23 +307,6 @@ index 9a748ea..9e3e013 100644
  
  
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
-diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..ee4e5e6 100644
---- a/osfmk/arm/arm_init.c
-+++ b/osfmk/arm/arm_init.c
-@@ -399,7 +399,12 @@ arm_init(
- 		/*
- 		 * Select the advertised kernel page size.
- 		 */
-+#if defined(LILAC)
-+		/* 4K-only pmap (the boot CPU has no 16K granule): always 4K. */
-+		if (0) {
-+#else
- 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
-+#endif
- 			/*
- 			 * arm64 device with > 1GB of RAM:
- 			 * kernel uses 16KB pages.
 diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
 index da0bbba..87867be 100644
 --- a/osfmk/arm/commpage/commpage_asm.s
@@ -454,10 +462,10 @@ index 437adb1..3885f23 100644
  #endif
 diff --git a/pexpert/pexpert/arm64/LILAC.h b/pexpert/pexpert/arm64/LILAC.h
 new file mode 100644
-index 0000000..b2c1789
+index 0000000..6ec709e
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/LILAC.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,89 @@
 +/*
 + * Board config for the Sony Xperia XZ1 Compact ("lilac", Qualcomm MSM8998 /
 + * Snapdragon 835): Kryo 280 = 4x Silver (MPIDR 0x000-0x003) + 4x Gold
@@ -487,6 +495,11 @@ index 0000000..b2c1789
 +
 +/* 4 Silver + 4 Gold; SMP stays opt-in through cpus=N (default 1). */
 +#define SWEET_SMP_MAX_CPUS         8
++
++/* Kryo 280 has no LSE: refuse any compiler setup that would emit CAS/LDADD. */
++#if defined(__ARM_FEATURE_ATOMICS) || defined(__ARM_ARCH_8_1__) || defined(__ARM_ARCH_8_2__)
++#error "LILAC must be built for ARMv8.0 without LSE (MACHINE_FLAGS_ARM64_LILAC)"
++#endif
 +
 +#define ARM_ARCH_TIMER
 +#define __ARM_ARCH__              8
