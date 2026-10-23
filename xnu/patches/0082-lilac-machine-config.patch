@@ -520,10 +520,10 @@ index b082a10..37035fe 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..396e7bb
+index 0000000..c2f8e7d
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,140 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -533,6 +533,9 @@ index 0000000..396e7bb
 + *   lilac_stop=N  reaching stage N resets after LILAC_STOP_SECS (20 s)
 + *   early vectors start.s LOW_VECTOR_TRAP resets after 45 s (no stack)
 + *   panic / halt  resets after LILAC_FATAL_BASE + LILAC_FATAL_STEP * last stage
++ *   probes        lilac_event(N) stops at N without changing last_stage:
++ *                 33 any IRQ, 34 ICC_SRE set, 35 vtimer armed, 36 GICD RWP done,
++ *                 37 vtimer asserted >1 s with no IRQ pending at the CPU
 + *   idle hang     lilac_idle_wait() replaces WFI; once LILAC_HANG_SECS have passed
 + *                 since lilac_diag_init it resets after LILAC_HANG_STEP * last stage
 + *                 (a kernel blocked with no wakeup source recovers by itself)
@@ -631,7 +634,23 @@ index 0000000..396e7bb
 +void
 +lilac_idle_wait(void)
 +{
++	static uint64_t fired_since;
 +	while ((__builtin_arm_rsr64("ISR_EL1") & ISR_EL1_IRQ_FIQ) == 0) {
++		uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
++		if ((ctl & 3) == 1) {
++			lilac_event(35);        /* virtual timer enabled and unmasked */
++		}
++		if ((ctl & 7) == 5) {           /* ENABLE, !IMASK, ISTATUS: timer asserted */
++			uint64_t now = lilac_counter(), f;
++			__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(f));
++			if (fired_since == 0) {
++				fired_since = now;
++			} else if (now - fired_since > f) {
++				lilac_event(37);        /* asserted >1 s, never reached the CPU: GIC routing */
++			}
++		} else {
++			fired_since = 0;
++		}
 +		if (lilac_hang_deadline != 0 && lilac_counter() >= lilac_hang_deadline) {
 +			lilac_reset_after(LILAC_HANG_STEP * (uint64_t)lilac_last_stage);
 +		}
@@ -685,7 +704,7 @@ index a1f2a91..41f1342 100644
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 24f1abc..e0394f2 100644
+index 24f1abc..6d74bdb 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -84,6 +84,7 @@
@@ -696,7 +715,17 @@ index 24f1abc..e0394f2 100644
  
  
  #ifndef __arm64__
-@@ -1868,6 +1869,9 @@ sleh_irq(arm_saved_state_t *state)
+@@ -1861,6 +1862,9 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if defined(LILAC)
++	lilac_event(33);                /* any IRQ exception taken */
++#endif
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
+@@ -1868,6 +1872,9 @@ sleh_irq(arm_saved_state_t *state)
  		return; /* spurious */
  	}
  	if (intid == sweet_vtimer_intid) {
@@ -1023,6 +1052,42 @@ index 1e7ca07..aa9ae79 100644
  
  	if (vm_compression_limit == 0) {
  		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..691b6a0 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,9 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#if defined(LILAC)
++#include <arm64/sweet_early.h>
++#endif
+ 
+ 
+ #if HAS_GIC_V3
+@@ -189,6 +192,11 @@ pe_init_fiq()
+ 	icc_sre |= ICC_SRE_SRE;
+ 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
+ 	__builtin_arm_isb(ISB_SY);
++#if defined(LILAC)
++	if (__builtin_arm_rsr64("ICC_SRE_EL1") & ICC_SRE_SRE) {
++		lilac_event(34);        /* system-register GIC interface really enabled */
++	}
++#endif
+ 
+ #if defined(SWEET)
+ 	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+@@ -211,6 +219,9 @@ pe_init_fiq()
+ 	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+ 		;
+ 	}
++#if defined(LILAC)
++	lilac_event(36);                /* GICD RWP spin finished (busy loop, no idle reset) */
++#endif
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+ #else
 diff --git a/pexpert/pexpert/arm64/LILAC.h b/pexpert/pexpert/arm64/LILAC.h
 new file mode 100644
 index 0000000..6ec709e
