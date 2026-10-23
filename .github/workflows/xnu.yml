@@ -54,9 +54,11 @@ jobs:
           # libfirehose_kernel is linked into the kernel; its arm64 slice otherwise
           # targets the macOS default CPU (apple-m1, LSE atomics), which faults on
           # ARMv8.0 cores (LILAC: Kryo 280). Build that slice for the kernel's CPU.
+          # The per-arch setting goes in the target's xcconfig, after build.sh's
+          # own edits there (xcodebuild splits bracketed settings on its command line).
           if [ "$MACHINE_CONFIG" = LILAC ]; then
-            sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\" OBJROOT/VALID_ARCHS=\"x86_64 arm64e arm64\" 'OTHER_CFLAGS[arch=arm64]=\$(inherited) -mcpu=cortex-a53' OBJROOT/" dxb/build.sh
-            grep -cF "'OTHER_CFLAGS[arch=arm64]=\$(inherited) -mcpu=cortex-a53'" dxb/build.sh
+            perl -0pi -e 's{(\n(\s*)sed -i \x27\x27 \x27s\|\$\(SDKROOT\)/usr/local/include\|[^\n]*libfirehose_kernel\.xcconfig"\n)}{$1$2echo \x27OTHER_CFLAGS[arch=arm64] = -mkernel -nostdinc -Wno-packed -mcpu=cortex-a53\x27 >> "\$\{SRCROOT\}/xcodeconfig/libfirehose_kernel.xcconfig"\n}' dxb/build.sh
+            grep -c 'OTHER_CFLAGS\[arch=arm64\] = -mkernel -nostdinc -Wno-packed -mcpu=cortex-a53' dxb/build.sh
           fi
           ls dxb/patches
 
