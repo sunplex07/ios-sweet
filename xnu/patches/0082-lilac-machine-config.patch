@@ -520,10 +520,10 @@ index b082a10..37035fe 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..c2f8e7d
+index 0000000..5154e0a
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,163 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -539,6 +539,13 @@ index 0000000..c2f8e7d
 + *   idle hang     lilac_idle_wait() replaces WFI; once LILAC_HANG_SECS have passed
 + *                 since lilac_diag_init it resets after LILAC_HANG_STEP * last stage
 + *                 (a kernel blocked with no wakeup source recovers by itself)
++ *   watchdog      lilac_wd_word (stage | LILAC_WD_FATAL | LILAC_WD_IDLE) is cleaned to
++ *                 PoC on every change. The G8 loader finds it by symbol and leaves a
++ *                 secondary CPU polling it MMU-off. Once the word has been unchanged
++ *                 for 30 s with neither flag set, that CPU resets at jump + 120 s + 8 s *
++ *                 stage, so busy or interrupts-masked hangs recover too (stage 22: 296 s,
++ *                 39-52: 432-536 s; disjoint from the panic delays 90 + 15 * stage).
++ *   stages 39-52  finer marks between kernel_bootstrap (22) and bsd_init (24), startup.c
 + * The steps exceed the ~9 s jitter of the UEFI-to-adb path seen in G1-G3.
 + * No allocation, locks or per-CPU state: usable from arm_init entry on.
 + */
@@ -558,6 +565,18 @@ index 0000000..c2f8e7d
 +static unsigned int lilac_stop_stage;   /* 0: no stop requested */
 +static unsigned int lilac_last_stage;
 +static uint64_t lilac_hang_deadline;    /* CNTVCT value; 0 before lilac_diag_init */
++
++#define LILAC_WD_FATAL          0x10000ull
++#define LILAC_WD_IDLE           0x20000ull
++/* Read by the loader's watchdog CPU with its MMU off: keep it alone in its cache line. */
++__attribute__((used, aligned(128))) volatile uint64_t lilac_wd_word;
++
++static void
++lilac_wd_publish(uint64_t v)
++{
++	lilac_wd_word = v;
++	__asm__ volatile ("dc civac, %0\n\tdsb sy" :: "r"(&lilac_wd_word) : "memory");
++}
 +
 +static uint64_t
 +lilac_counter(void)
@@ -613,6 +632,7 @@ index 0000000..c2f8e7d
 +lilac_mark(unsigned int stage)
 +{
 +	lilac_last_stage = stage;
++	lilac_wd_publish(stage);
 +	if (stage == lilac_stop_stage) {
 +		lilac_reset_after(LILAC_STOP_SECS);
 +	}
@@ -635,6 +655,7 @@ index 0000000..c2f8e7d
 +lilac_idle_wait(void)
 +{
 +	static uint64_t fired_since;
++	lilac_wd_publish(lilac_last_stage | LILAC_WD_IDLE);
 +	while ((__builtin_arm_rsr64("ISR_EL1") & ISR_EL1_IRQ_FIQ) == 0) {
 +		uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
 +		if ((ctl & 3) == 1) {
@@ -656,11 +677,13 @@ index 0000000..c2f8e7d
 +		}
 +		__asm__ volatile ("yield");
 +	}
++	lilac_wd_publish(lilac_last_stage);
 +}
 +
 +void
 +lilac_fatal_reset(void)
 +{
++	lilac_wd_publish(lilac_last_stage | LILAC_WD_FATAL);
 +	lilac_reset_after(LILAC_FATAL_BASE + LILAC_FATAL_STEP * (uint64_t)lilac_last_stage);
 +}
 +#endif /* LILAC */
@@ -887,10 +910,10 @@ index 6928957..44a87a1 100644
  #include <kern/misc_protos.h>
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..27ffbf6 100644
+index d7a25f2..4209e41 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -6,12 +6,32 @@
+@@ -6,12 +6,33 @@
  #include <stdarg.h>
  #include <stdint.h>
  
@@ -915,6 +938,7 @@ index d7a25f2..27ffbf6 100644
 +void lilac_event(unsigned int stage);
 +void lilac_idle_wait(void);
 +void lilac_fatal_reset(void);
++extern volatile uint64_t lilac_wd_word;  /* watchdog mailbox, see lilac_diag.c */
 +static inline void sweet_early_mark(unsigned int stage, const char *label)
 +{
 +	(void)label;
@@ -924,7 +948,7 @@ index d7a25f2..27ffbf6 100644
  #else
  static inline void sweet_early_mark(unsigned int stage, const char *label)
  {
-@@ -21,4 +41,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -21,4 +42,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
  static inline void sweet_early_disable(void) {}
  #endif
  
@@ -966,7 +990,7 @@ index 437adb1..06f23cd 100644
  #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
  	read_lbr();
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index bec97fb..82c8466 100644
+index bec97fb..b8de66b 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -148,6 +148,12 @@
@@ -982,15 +1006,108 @@ index bec97fb..82c8466 100644
  #if MACH_KDP
  #include <kdp/kdp.h>
  #endif
-@@ -426,6 +432,7 @@ kernel_bootstrap(void)
+@@ -426,12 +432,15 @@ kernel_bootstrap(void)
  	thread_t        thread;
  	char            namep[16];
  
 +	sweet_early_mark(22, "kernel_bootstrap");
  	printf("%s\n", version); /* log kernel version */
++	sweet_early_mark(39, "version printed");
  
  	scale_setup();
-@@ -786,6 +793,7 @@ kernel_bootstrap_thread(void)
+ 
+ 	kernel_bootstrap_log("vm_mem_bootstrap");
+ 	vm_mem_bootstrap();
++	sweet_early_mark(40, "vm_mem_bootstrap returned");
+ 
+ 	machine_info.memory_size = (uint32_t)mem_size;
+ #if XNU_TARGET_OS_OSX
+@@ -480,6 +489,7 @@ kernel_bootstrap(void)
+ 	kernel_bootstrap_log("stackshot_init");
+ 	stackshot_init();
+ 
++	sweet_early_mark(41, "sched_init");
+ 	kernel_bootstrap_log("sched_init");
+ 	sched_init();
+ 
+@@ -500,14 +510,17 @@ kernel_bootstrap(void)
+ 	kernel_bootstrap_log("mapping_free_prime");
+ 	mapping_free_prime();                                           /* Load up with temporary mapping blocks */
+ 
++	sweet_early_mark(42, "machine_init");
+ 	kernel_bootstrap_log("machine_init");
+ 	machine_init();
+ 
+ 	kernel_bootstrap_log("thread_machine_init_template");
+ 	thread_machine_init_template();
+ 
++	sweet_early_mark(43, "clock_init");
+ 	kernel_bootstrap_log("clock_init");
+ 	clock_init();
++	sweet_early_mark(44, "clock_init returned");
+ 
+ 	/*
+ 	 *	Initialize the IPC, task, and thread subsystems.
+@@ -560,6 +573,7 @@ kernel_bootstrap(void)
+ 	 *	Create a kernel thread to execute the kernel bootstrap.
+ 	 */
+ 
++	sweet_early_mark(45, "kernel_thread_create");
+ 	kernel_bootstrap_log("kernel_thread_create");
+ 	result = kernel_thread_create((thread_continue_t)kernel_bootstrap_thread, NULL, MAXPRI_KERNEL, &thread);
+ 
+@@ -574,6 +588,7 @@ kernel_bootstrap(void)
+ 
+ 	thread_deallocate(thread);
+ 
++	sweet_early_mark(46, "load_context");
+ 	kernel_bootstrap_log("load_context - done");
+ 	load_context(thread);
+ 	/*NOTREACHED*/
+@@ -598,6 +613,7 @@ kernel_bootstrap_thread(void)
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_KERNEL_BOOTSTRAP);
+ #endif
+ 
++	sweet_early_mark(47, "kernel_bootstrap_thread");
+ 	kernel_bootstrap_thread_log("idle_thread_create");
+ 	/*
+ 	 * Create the idle processor thread.
+@@ -610,6 +626,7 @@ kernel_bootstrap_thread(void)
+ 	 *
+ 	 * Start up the scheduler services.
+ 	 */
++	sweet_early_mark(48, "sched_startup");
+ 	kernel_bootstrap_thread_log("sched_startup");
+ 	sched_startup();
+ 
+@@ -640,6 +657,7 @@ kernel_bootstrap_thread(void)
+ 	/*
+ 	 *	Create the clock service.
+ 	 */
++	sweet_early_mark(49, "clock_service_create");
+ 	kernel_bootstrap_thread_log("clock_service_create");
+ 	clock_service_create();
+ 
+@@ -685,8 +703,10 @@ kernel_bootstrap_thread(void)
+ 	vm_kernel_addrhash_salt_ext = early_random();
+ 
+ #ifdef  IOKIT
++	sweet_early_mark(50, "PE_init_iokit");
+ 	kernel_bootstrap_log("PE_init_iokit");
+ 	PE_init_iokit();
++	sweet_early_mark(51, "PE_init_iokit returned");
+ #endif
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+@@ -769,6 +789,7 @@ kernel_bootstrap_thread(void)
+ #endif /* CONFIG_XNUPOST */
+ 
+ #ifdef  IOKIT
++	sweet_early_mark(52, "PE_lockdown_iokit");
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
+ #endif
+@@ -786,6 +807,7 @@ kernel_bootstrap_thread(void)
  	/*
  	 *	Start the user bootstrap.
  	 */
