@@ -68,7 +68,7 @@ index 6b926fe..ab150b7 100644
  		int error = sweet_ufs_init();
  		if (error) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..daadbb6 100644
+index bb2a2bf..043520c 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -164,6 +164,11 @@
@@ -83,7 +83,23 @@ index bb2a2bf..daadbb6 100644
  #include <sys/kern_overrides.h>         /* for init_system_override() */
  #include <sys/lockf.h>                  /* for lf_init() */
  #include <sys/fsctl.h>
-@@ -879,6 +884,7 @@ bsd_init(void)
+@@ -685,7 +690,9 @@ bsd_init(void)
+ 	 * Initialize the calendar.
+ 	 */
+ 	bsd_init_kprintf("calling IOKitInitializeTime\n");
++	sweet_early_mark(27, "IOKitInitializeTime");
+ 	IOKitInitializeTime();
++	sweet_early_mark(29, "IOKitInitializeTime returned");
+ 
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+@@ -874,11 +881,13 @@ bsd_init(void)
+ 
+ 		bsd_init_kprintf("calling setconf\n");
+ 		setconf();
++		sweet_early_mark(31, "setconf returned");
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
  #endif
  
  		bsd_init_kprintf("vfs_mountroot\n");
@@ -91,7 +107,7 @@ index bb2a2bf..daadbb6 100644
  		if (0 == (err = vfs_mountroot())) {
  			break;
  		}
-@@ -1098,6 +1104,7 @@ bsdinit_task(void)
+@@ -1098,6 +1107,7 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
@@ -275,6 +291,26 @@ index 92f3e26..e1c676f 100644
      "     'IOProbeScore'    = 10000:32;"
      "   },"
      "   {"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..840e2b5 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -43,6 +43,7 @@ extern "C" {
+ #include <vm/pmap.h>
+ #include <vm/vm_map.h>
+ #include <pexpert/pexpert.h>
++#include <arm64/sweet_early.h>
+ #include <kern/clock.h>
+ #if CONFIG_KDP_INTERACTIVE_DEBUGGING
+ #include <kern/debug.h>
+@@ -921,6 +922,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 
+ #if XNU_TARGET_OS_OSX && defined(__arm64__)
+ 			// The disk isn't found - have the user pick from System Recovery.
++			sweet_early_mark(30, "IOSetRecoveryBoot");
+ 			(void)IOSetRecoveryBoot(BSD_BOOTFAIL_MEDIA_MISSING, NULL, true);
+ #elif XNU_TARGET_OS_IOS
+ 			panic("Failed to mount root device");
 diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
 index aca295c..46937dc 100644
 --- a/libkern/conf/Makefile.template
@@ -432,12 +468,33 @@ index 06bb568..987bc88 100644
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
  	sweet_early_relocate(SWEET_EARLY_FB_VA);
  #endif
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..37035fe 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -79,6 +79,7 @@
+ 
+ 
+ #include <libkern/section_keywords.h>
++#include <arm64/sweet_early.h>
+ 
+ extern boolean_t        idle_enable;
+ extern uint64_t         wake_abstime;
+@@ -587,6 +588,8 @@ cpu_idle(void)
+ 		__builtin_arm_dsb(DSB_SY);
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
++#elif defined(LILAC)
++		lilac_idle_wait();
+ #else
+ 		__builtin_arm_wfi();
+ #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..8ab4f1e
+index 0000000..396e7bb
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,121 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -447,6 +504,9 @@ index 0000000..8ab4f1e
 + *   lilac_stop=N  reaching stage N resets after LILAC_STOP_SECS (20 s)
 + *   early vectors start.s LOW_VECTOR_TRAP resets after 45 s (no stack)
 + *   panic / halt  resets after LILAC_FATAL_BASE + LILAC_FATAL_STEP * last stage
++ *   idle hang     lilac_idle_wait() replaces WFI; once LILAC_HANG_SECS have passed
++ *                 since lilac_diag_init it resets after LILAC_HANG_STEP * last stage
++ *                 (a kernel blocked with no wakeup source recovers by itself)
 + * The steps exceed the ~9 s jitter of the UEFI-to-adb path seen in G1-G3.
 + * No allocation, locks or per-CPU state: usable from arm_init entry on.
 + */
@@ -458,10 +518,14 @@ index 0000000..8ab4f1e
 +#define LILAC_STOP_SECS         20u
 +#define LILAC_FATAL_BASE        90u
 +#define LILAC_FATAL_STEP        15u
++#define LILAC_HANG_SECS         600u
++#define LILAC_HANG_STEP         5u
 +#define PSCI_SYSTEM_RESET       0x84000009ull
++#define ISR_EL1_IRQ_FIQ         0xC0ull
 +
 +static unsigned int lilac_stop_stage;   /* 0: no stop requested */
 +static unsigned int lilac_last_stage;
++static uint64_t lilac_hang_deadline;    /* CNTVCT value; 0 before lilac_diag_init */
 +
 +static uint64_t
 +lilac_counter(void)
@@ -491,6 +555,9 @@ index 0000000..8ab4f1e
 +lilac_diag_init(const char *cmdline)
 +{
 +	static const char key[] = "lilac_stop=";
++	uint64_t freq;
++	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(freq));
++	lilac_hang_deadline = lilac_counter() + (uint64_t)LILAC_HANG_SECS * freq;
 +	for (unsigned int i = 0; i < 608 && cmdline[i]; i++) {
 +		if (i != 0 && cmdline[i - 1] != ' ') {
 +			continue;
@@ -516,6 +583,30 @@ index 0000000..8ab4f1e
 +	lilac_last_stage = stage;
 +	if (stage == lilac_stop_stage) {
 +		lilac_reset_after(LILAC_STOP_SECS);
++	}
++}
++
++/* A probe that may stop the boot but does not change the recorded stage. */
++void
++lilac_event(unsigned int stage)
++{
++	if (stage == lilac_stop_stage) {
++		lilac_reset_after(LILAC_STOP_SECS);
++	}
++}
++
++/*
++ * Idle in place of WFI: return as soon as an IRQ or FIQ is pending (ISR_EL1
++ * reports it even while PSTATE masks it, which is what wakes WFI).
++ */
++void
++lilac_idle_wait(void)
++{
++	while ((__builtin_arm_rsr64("ISR_EL1") & ISR_EL1_IRQ_FIQ) == 0) {
++		if (lilac_hang_deadline != 0 && lilac_counter() >= lilac_hang_deadline) {
++			lilac_reset_after(LILAC_HANG_STEP * (uint64_t)lilac_last_stage);
++		}
++		__asm__ volatile ("yield");
 +	}
 +}
 +
@@ -564,6 +655,28 @@ index a1f2a91..41f1342 100644
  		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..0f2064a 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -83,6 +83,7 @@
+ 
+ #if CONFIG_UBSAN_MINIMAL
+ #include <san/ubsan_minimal.h>
++#include <arm64/sweet_early.h>
+ #endif /* CONFIG_UBSAN_MINIMAL */
+ 
+ 
+@@ -1868,6 +1869,9 @@ sleh_irq(arm_saved_state_t *state)
+ 		return; /* spurious */
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
++#if defined(LILAC)
++		lilac_event(28);        /* first virtual-timer IRQ taken */
++#endif
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 023086f..3d585d0 100644
 --- a/osfmk/arm64/start.s
@@ -716,14 +829,18 @@ index 6928957..44a87a1 100644
  #include <kern/misc_protos.h>
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..e64b9df 100644
+index d7a25f2..27ffbf6 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -6,12 +6,26 @@
+@@ -6,12 +6,32 @@
  #include <stdarg.h>
  #include <stdint.h>
  
 -#if defined(SWEET)
++#ifdef __cplusplus
++extern "C" {
++#endif
++
 +#if defined(SWEET_EARLY_FB)
  void sweet_early_mark(unsigned int stage, const char *label);
  void sweet_early_putc(char c);
@@ -737,6 +854,8 @@ index d7a25f2..e64b9df 100644
 + */
 +void lilac_diag_init(const char *cmdline);
 +void lilac_mark(unsigned int stage);
++void lilac_event(unsigned int stage);
++void lilac_idle_wait(void);
 +void lilac_fatal_reset(void);
 +static inline void sweet_early_mark(unsigned int stage, const char *label)
 +{
@@ -747,6 +866,15 @@ index d7a25f2..e64b9df 100644
  #else
  static inline void sweet_early_mark(unsigned int stage, const char *label)
  {
+@@ -21,4 +41,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ static inline void sweet_early_disable(void) {}
+ #endif
+ 
++#ifdef __cplusplus
++}
++#endif
++
+ #endif
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
 index b0dad49..05530f8 100644
 --- a/osfmk/conf/files.arm64
