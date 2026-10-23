@@ -51,6 +51,13 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is linked into the kernel; its arm64 slice otherwise
+          # targets the macOS default CPU (apple-m1, LSE atomics), which faults on
+          # ARMv8.0 cores (LILAC: Kryo 280). Build that slice for the kernel's CPU.
+          if [ "$MACHINE_CONFIG" = LILAC ]; then
+            sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\" OBJROOT/VALID_ARCHS=\"x86_64 arm64e arm64\" 'OTHER_CFLAGS[arch=arm64]=\$(inherited) -mcpu=cortex-a53' OBJROOT/" dxb/build.sh
+            grep -cF "'OTHER_CFLAGS[arch=arm64]=\$(inherited) -mcpu=cortex-a53'" dxb/build.sh
+          fi
           ls dxb/patches
 
       - name: Deps
@@ -73,6 +80,15 @@ jobs:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
+
+      - name: Check libfirehose_kernel arm64 slice is ARMv8.0 (LILAC)
+        if: env.MACHINE_CONFIG == 'LILAC'
+        run: |
+          lipo -thin arm64 dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a -output fh-arm64.a
+          xcrun objdump -d --no-show-raw-insn fh-arm64.a > fh-arm64.txt
+          n=$(grep -cwE 'cas[a-z]*|ldadd[a-z]*|ldclr[a-z]*|ldeor[a-z]*|ldset[a-z]*|ldsmax[a-z]*|ldsmin[a-z]*|ldumax[a-z]*|ldumin[a-z]*|swp[a-z]*|stadd[a-z]*|stclr[a-z]*|stset[a-z]*|ldapr[a-z]*' fh-arm64.txt || true)
+          echo "LSE/RCpc instructions in libfirehose_kernel arm64: $n"
+          [ "$n" -eq 0 ]
 
       - name: Package build tree for local compiles
         if: always()
