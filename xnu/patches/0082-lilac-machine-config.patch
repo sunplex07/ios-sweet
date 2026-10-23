@@ -460,6 +460,60 @@ index 437adb1..3885f23 100644
  	/* No CPU/thread/debugger state is required for this first panic copy. */
  	sweet_early_panic(panic_format_str, panic_args);
  #endif
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..202e658 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,11 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/*
++ * The macOS zone VA needs the large-memory kernel layout; without
++ * ARM_LARGE_MEMORY the whole arm64 kernel VA is 112G (vm_param.h).
++ */
++#if XNU_PLATFORM_MacOSX && (!defined(__arm64__) || defined(ARM_LARGE_MEMORY))
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..d2cb8dd 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,13 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++/*
++ * The 47-bit macOS user VA needs 16K pages (T0SZ 17). A 4K-page kernel has a
++ * 39-bit TTBR0 (T0SZ 25, proc_reg.h), so it uses the embedded layout, which
++ * also keeps the commpage nesting region above the user VA (pmap.c).
++ */
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && \
++    !(defined(XNU_KERNEL_PRIVATE) && defined(__arm64__) && !__ARM_16K_PG__)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..aa9ae79 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -811,7 +811,12 @@ vm_compressor_set_size(void)
+ 	compressor_pool_max_size = C_SEG_MAX_LIMIT;
+ 	compressor_pool_max_size *= c_seg_bufsize;
+ 
+-#if XNU_TARGET_OS_OSX
++	/*
++	 * The macOS pool (up to 16x RAM) is sized for the large-memory kernel
++	 * VA; without ARM_LARGE_MEMORY it would not fit, so size it like embedded
++	 * (cf. VM_MAX_SWAP_FILE_SWAP_ENABLED_NUM in vm_compressor_backing_store.c).
++	 */
++#if XNU_TARGET_OS_OSX && (!defined(__arm64__) || defined(ARM_LARGE_MEMORY))
+ 
+ 	if (vm_compression_limit == 0) {
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
 diff --git a/pexpert/pexpert/arm64/LILAC.h b/pexpert/pexpert/arm64/LILAC.h
 new file mode 100644
 index 0000000..6ec709e
