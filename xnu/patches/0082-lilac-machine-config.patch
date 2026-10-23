@@ -264,10 +264,20 @@ index 0000000..65be5f9
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..c2059d7 100644
+index 2545cf9..232911c 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -73,16 +73,26 @@ SweetCPU::start(IOService *provider)
+@@ -15,6 +15,9 @@
+ #include <kern/clock.h>
+ #include <kern/processor.h>
+ #include <kern/thread.h>
++#if defined(LILAC)
++#include <arm64/sweet_early.h>
++#endif
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -73,16 +76,26 @@ SweetCPU::start(IOService *provider)
  	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
  		return false;
  	}
@@ -294,6 +304,54 @@ index 2545cf9..c2059d7 100644
  	if (cpuName == NULL) {
  		return false;
  	}
+@@ -112,6 +125,9 @@ SweetCPU::start(IOService *provider)
+ 	__atomic_add_fetch(&sweet_cpus_registered, 1, __ATOMIC_ACQ_REL);
+ 	if (cpu == topology->boot_cpu) {
+ 		thread_t thread;
++#if defined(LILAC)
++		sweet_early_mark(57, "SweetCPU boot CPU registered");
++#endif
+ 		result = kernel_thread_start(&SweetCPU::startAll, NULL, &thread);
+ 		if (result != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cannot create startup thread: %d", result);
+@@ -127,6 +143,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
++#if defined(LILAC)
++	sweet_early_mark(58, "SweetCPU::startAll");
++#endif
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+@@ -144,6 +163,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
++#if defined(LILAC)
++	sweet_early_mark(59, "SweetCPU all CPUs registered");
++#endif
+ 	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+@@ -168,11 +190,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
++#if defined(LILAC)
++	sweet_early_mark(60, "SweetCPU all CPUs alive");
++#endif
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
++#if defined(LILAC)
++	sweet_early_mark(61, "SweetCPU ml_set_max_cpus");
++#endif
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+ 	thread_terminate(current_thread());
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 index 92f3e26..e1c676f 100644
 --- a/iokit/KernelConfigTables.cpp
@@ -498,7 +556,7 @@ index 06bb568..987bc88 100644
  	sweet_early_relocate(SWEET_EARLY_FB_VA);
  #endif
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index b082a10..37035fe 100644
+index b082a10..510b0fd 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
 @@ -79,6 +79,7 @@
@@ -509,7 +567,31 @@ index b082a10..37035fe 100644
  
  extern boolean_t        idle_enable;
  extern uint64_t         wake_abstime;
-@@ -587,6 +588,8 @@ cpu_idle(void)
+@@ -417,7 +418,13 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 		__builtin_arm_wsr("DAIFClr", (DAIFSC_IRQF | DAIFSC_FIQF));
+ 	}
+ 
++#if defined(LILAC)
++	lilac_wfe_enter();
++#endif
+ 	while ((ipending = (cpu_interrupt_is_pending())) == false) {
++#if defined(LILAC)
++		lilac_wfe_poll();
++#endif
+ 		if (unmask) {
+ 			/* If WFE was issued with IRQs unmasked, an
+ 			 * interrupt may have been processed.
+@@ -459,6 +466,9 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 			}
+ 		}
+ 	}
++#if defined(LILAC)
++	lilac_wfe_exit();
++#endif
+ 
+ 	if (unmask) {
+ 		/* Re-mask IRQ+FIQ
+@@ -587,6 +597,8 @@ cpu_idle(void)
  		__builtin_arm_dsb(DSB_SY);
  #if HAS_RETENTION_STATE
  		arm64_retention_wfi();
@@ -520,10 +602,10 @@ index b082a10..37035fe 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..5154e0a
+index 0000000..ea0fccd
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,196 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -542,10 +624,14 @@ index 0000000..5154e0a
 + *   watchdog      lilac_wd_word (stage | LILAC_WD_FATAL | LILAC_WD_IDLE) is cleaned to
 + *                 PoC on every change. The G8 loader finds it by symbol and leaves a
 + *                 secondary CPU polling it MMU-off. Once the word has been unchanged
-+ *                 for 30 s with neither flag set, that CPU resets at jump + 120 s + 8 s *
-+ *                 stage, so busy or interrupts-masked hangs recover too (stage 22: 296 s,
-+ *                 39-52: 432-536 s; disjoint from the panic delays 90 + 15 * stage).
++ *                 for 30 s with neither flag set, that CPU resets at jump + 60 s + 6 s *
++ *                 stage, so busy or interrupts-masked hangs recover too (stage 22: 192 s,
++ *                 52: 372 s; below the panic delay 90 + 15 * stage >= 420 s for stage >= 22).
++ *                 A set flag defers to the paths above; the loader caps the run at 1000 s.
 + *   stages 39-52  finer marks between kernel_bootstrap (22) and bsd_init (24), startup.c
++ *   stages 53-61  after PE_lockdown_iokit: pe_init.c, startup.c, SweetCPU.cpp
++ *   stage 62      transient: published while cpu_idle spins in wfe_to_deadline_or_interrupt
++ *                 (proximate-timer path, which bypasses lilac_idle_wait); restored on exit
 + * The steps exceed the ~9 s jitter of the UEFI-to-adb path seen in G1-G3.
 + * No allocation, locks or per-CPU state: usable from arm_init entry on.
 + */
@@ -651,12 +737,11 @@ index 0000000..5154e0a
 + * Idle in place of WFI: return as soon as an IRQ or FIQ is pending (ISR_EL1
 + * reports it even while PSTATE masks it, which is what wakes WFI).
 + */
-+void
-+lilac_idle_wait(void)
++static void
++lilac_idle_checks(void)
 +{
 +	static uint64_t fired_since;
-+	lilac_wd_publish(lilac_last_stage | LILAC_WD_IDLE);
-+	while ((__builtin_arm_rsr64("ISR_EL1") & ISR_EL1_IRQ_FIQ) == 0) {
++	{
 +		uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
 +		if ((ctl & 3) == 1) {
 +			lilac_event(35);        /* virtual timer enabled and unmasked */
@@ -675,8 +760,38 @@ index 0000000..5154e0a
 +		if (lilac_hang_deadline != 0 && lilac_counter() >= lilac_hang_deadline) {
 +			lilac_reset_after(LILAC_HANG_STEP * (uint64_t)lilac_last_stage);
 +		}
++	}
++}
++
++void
++lilac_idle_wait(void)
++{
++	lilac_wd_publish(lilac_last_stage | LILAC_WD_IDLE);
++	while ((__builtin_arm_rsr64("ISR_EL1") & ISR_EL1_IRQ_FIQ) == 0) {
++		lilac_idle_checks();
 +		__asm__ volatile ("yield");
 +	}
++	lilac_wd_publish(lilac_last_stage);
++}
++
++#define LILAC_WFE_STAGE         62u
++
++void
++lilac_wfe_enter(void)
++{
++	lilac_wd_publish(LILAC_WFE_STAGE);
++	lilac_event(LILAC_WFE_STAGE);
++}
++
++void
++lilac_wfe_poll(void)
++{
++	lilac_idle_checks();
++}
++
++void
++lilac_wfe_exit(void)
++{
 +	lilac_wd_publish(lilac_last_stage);
 +}
 +
@@ -910,10 +1025,10 @@ index 6928957..44a87a1 100644
  #include <kern/misc_protos.h>
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..4209e41 100644
+index d7a25f2..f96ab10 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -6,12 +6,33 @@
+@@ -6,12 +6,36 @@
  #include <stdarg.h>
  #include <stdint.h>
  
@@ -937,6 +1052,9 @@ index d7a25f2..4209e41 100644
 +void lilac_mark(unsigned int stage);
 +void lilac_event(unsigned int stage);
 +void lilac_idle_wait(void);
++void lilac_wfe_enter(void);
++void lilac_wfe_poll(void);
++void lilac_wfe_exit(void);
 +void lilac_fatal_reset(void);
 +extern volatile uint64_t lilac_wd_word;  /* watchdog mailbox, see lilac_diag.c */
 +static inline void sweet_early_mark(unsigned int stage, const char *label)
@@ -948,7 +1066,7 @@ index d7a25f2..4209e41 100644
  #else
  static inline void sweet_early_mark(unsigned int stage, const char *label)
  {
-@@ -21,4 +42,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -21,4 +45,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
  static inline void sweet_early_disable(void) {}
  #endif
  
@@ -990,7 +1108,7 @@ index 437adb1..06f23cd 100644
  #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
  	read_lbr();
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index bec97fb..b8de66b 100644
+index bec97fb..b9484fd 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
 @@ -148,6 +148,12 @@
@@ -1107,7 +1225,18 @@ index bec97fb..b8de66b 100644
  	kernel_bootstrap_log("PE_lockdown_iokit");
  	PE_lockdown_iokit();
  #endif
-@@ -786,6 +807,7 @@ kernel_bootstrap_thread(void)
+@@ -777,15 +798,18 @@ kernel_bootstrap_thread(void)
+ 	 * at the latest
+ 	 */
+ 	vm_set_restrictions(machine_info.max_cpus);
++	sweet_early_mark(55, "vm_set_restrictions returned");
+ 
+ 
+ #if KPERF
+ 	kperf_init_early();
++	sweet_early_mark(56, "kperf_init_early returned (max_cpus set)");
+ #endif
+ 
  	/*
  	 *	Start the user bootstrap.
  	 */
@@ -1205,6 +1334,34 @@ index 6089db9..691b6a0 100644
  	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
  	__builtin_arm_isb(ISB_SY);
  #else
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..018f528 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -21,6 +21,9 @@
+ #include <os/overflow.h>
+ 
+ #include <pexpert/arm64/board_config.h>
++#if defined(LILAC)
++#include <arm64/sweet_early.h>
++#endif
+ 
+ 
+ /* extern references */
+@@ -379,7 +382,13 @@ PE_lockdown_iokit(void)
+ 	 * hardware protections.
+ 	 */
+ 	zalloc_iokit_lockdown();
++#if defined(LILAC)
++	sweet_early_mark(53, "zalloc_iokit_lockdown returned");
++#endif
+ 	StartIOKitMatching();
++#if defined(LILAC)
++	sweet_early_mark(54, "StartIOKitMatching returned");
++#endif
+ }
+ 
+ void
 diff --git a/pexpert/pexpert/arm64/LILAC.h b/pexpert/pexpert/arm64/LILAC.h
 new file mode 100644
 index 0000000..6ec709e
