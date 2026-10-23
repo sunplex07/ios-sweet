@@ -115,6 +115,35 @@ index bb2a2bf..043520c 100644
  	load_init_program(p);
  	lock_trace = 1;
  }
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..d590ddc 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -177,6 +177,11 @@
+ #if CONFIG_MEMORYSTATUS
+ #include <sys/kern_memorystatus.h>
+ #endif
++#if defined(__arm64__)
++#include <arm64/sweet_early.h>
++#else
++#define sweet_early_mark(stage, label) do { } while (0)
++#endif
+ 
+ #include <IOKit/IOBSD.h>
+ 
+@@ -6828,7 +6833,11 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path)
+ 	 */
+ 	set_security_token(p);
+ 
+-	return execve(p, &init_exec_args, retval);
++	error = execve(p, &init_exec_args, retval);
++	if (error == 0) {
++		sweet_early_mark(32, "PID 1 exec succeeded");
++	}
++	return error;
+ }
+ 
+ static const char * init_programs[] = {
 diff --git a/config/MASTER.arm64.lilac b/config/MASTER.arm64.lilac
 new file mode 100644
 index 0000000..65be5f9
