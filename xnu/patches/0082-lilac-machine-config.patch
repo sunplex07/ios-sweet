@@ -565,18 +565,20 @@ index a1f2a91..41f1342 100644
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 023086f..d3cf45a 100644
+index 023086f..1106faa 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -38,6 +38,36 @@
+@@ -38,8 +38,39 @@
  
  #if __ARM_KERNEL_PROTECT__
  #include <arm/pmap.h>
 +
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
 +#if defined(LILAC)
 +/*
 + * No console exists on LILAC: an exception taken before the real vectors are
-+ * installed waits LILAC_LOWVEC_SECS (lilac_diag.c) and then resets via PSCI
++ * installed waits 45 s (see lilac_diag.c) and then resets via PSCI
 + * SYSTEM_RESET. Stack-free and position-independent (MMU on or off).
 + */
 +.macro LOW_VECTOR_TRAP
@@ -602,10 +604,11 @@ index 023086f..d3cf45a 100644
 +	b		.
 +.endm
 +#endif
- #endif /* __ARM_KERNEL_PROTECT__ */
++
  
  
-@@ -114,13 +144,13 @@ LEXT(LowResetVectorBase)
+ .macro MSR_VBAR_EL1_X0
+@@ -114,13 +145,13 @@ LEXT(LowResetVectorBase)
  
  	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
  	.align	9
@@ -623,7 +626,7 @@ index 023086f..d3cf45a 100644
  
  	.align	7
  	.globl EXT(reset_vector)
-@@ -233,40 +263,40 @@ LEXT(_start)
+@@ -233,40 +264,40 @@ LEXT(_start)
  	.global	EXT(LowExceptionVectorBase)
  LEXT(LowExceptionVectorBase)
  	/* EL1 SP 0 */
@@ -680,7 +683,7 @@ index 023086f..d3cf45a 100644
  	.align 12, 0
  
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
-@@ -513,7 +543,7 @@ LEXT(start_first_cpu)
+@@ -513,7 +544,7 @@ LEXT(start_first_cpu)
  	mov		x20, x0
  	mov		x21, #0
  
@@ -689,7 +692,7 @@ index 023086f..d3cf45a 100644
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
  	mov		w1, #-1
-@@ -678,7 +708,7 @@ Lkernelcache_base_found:
+@@ -678,7 +709,7 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
