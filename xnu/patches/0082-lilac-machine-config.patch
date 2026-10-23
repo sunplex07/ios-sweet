@@ -67,6 +67,38 @@ index 6b926fe..ab150b7 100644
  	if (!su.ready) {
  		int error = sweet_ufs_init();
  		if (error) {
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..daadbb6 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -164,6 +164,11 @@
+ #include <net/restricted_in_port.h>     /* for restricted_in_port_init() */
+ #include <net/remote_vif.h>             /* for rvi_init() */
+ #include <kern/assert.h>                /* for assert() */
++#if defined(__arm64__)
++#include <arm64/sweet_early.h>
++#else
++#define sweet_early_mark(stage, label) do { } while (0)
++#endif
+ #include <sys/kern_overrides.h>         /* for init_system_override() */
+ #include <sys/lockf.h>                  /* for lf_init() */
+ #include <sys/fsctl.h>
+@@ -879,6 +884,7 @@ bsd_init(void)
+ #endif
+ 
+ 		bsd_init_kprintf("vfs_mountroot\n");
++		sweet_early_mark(25, "vfs_mountroot");
+ 		if (0 == (err = vfs_mountroot())) {
+ 			break;
+ 		}
+@@ -1098,6 +1104,7 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++	sweet_early_mark(26, "load_init_program");
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
 diff --git a/config/MASTER.arm64.lilac b/config/MASTER.arm64.lilac
 new file mode 100644
 index 0000000..65be5f9
@@ -307,6 +339,20 @@ index 9a748ea..9e3e013 100644
  
  
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..85c17c0 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,9 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if defined(LILAC)
++	lilac_diag_init(args->CommandLine);
++#endif
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
 diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
 index da0bbba..87867be 100644
 --- a/osfmk/arm/commpage/commpage_asm.s
@@ -386,11 +432,130 @@ index 06bb568..987bc88 100644
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
  	sweet_early_relocate(SWEET_EARLY_FB_VA);
  #endif
+diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
+new file mode 100644
+index 0000000..d75ed08
+--- /dev/null
++++ b/osfmk/arm64/lilac_diag.c
+@@ -0,0 +1,87 @@
++/*
++ * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
++ *
++ * The board has no usable serial port and the command-mode panel does not show
++ * post-ExitBootServices framebuffer writes, so progress is encoded in the time
++ * until a PSCI SYSTEM_RESET returns the phone to Android:
++ *   lilac_stop=N  reaching stage N resets after LILAC_STOP_SECS (20 s)
++ *   early vectors start.s LOW_VECTOR_TRAP resets after 45 s (no stack)
++ *   panic / halt  resets after LILAC_FATAL_BASE + LILAC_FATAL_STEP * last stage
++ * The steps exceed the ~9 s jitter of the UEFI-to-adb path seen in G1-G3.
++ * No allocation, locks or per-CPU state: usable from arm_init entry on.
++ */
++#include <arm64/sweet_early.h>
++
++#if defined(LILAC)
++#include <stdint.h>
++
++#define LILAC_STOP_SECS         20u
++#define LILAC_FATAL_BASE        90u
++#define LILAC_FATAL_STEP        15u
++#define PSCI_SYSTEM_RESET       0x84000009ull
++
++static unsigned int lilac_stop_stage;   /* 0: no stop requested */
++static unsigned int lilac_last_stage;
++
++static uint64_t
++lilac_counter(void)
++{
++	uint64_t v;
++	__asm__ volatile ("isb\n\tmrs %0, CNTPCT_EL0" : "=r"(v) :: "memory");
++	return v;
++}
++
++/* Returns only if PSCI SYSTEM_RESET returns. */
++static void
++lilac_reset_after(uint64_t secs)
++{
++	uint64_t freq;
++	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(freq));
++	uint64_t end = lilac_counter() + secs * freq;
++	while (lilac_counter() < end) {
++		__asm__ volatile ("yield");
++	}
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	__asm__ volatile ("dsb sy\n\tsmc #0" : "+r"(x0) ::
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++}
++
++void
++lilac_diag_init(const char *cmdline)
++{
++	static const char key[] = "lilac_stop=";
++	for (unsigned int i = 0; i < 608 && cmdline[i]; i++) {
++		if (i != 0 && cmdline[i - 1] != ' ') {
++			continue;
++		}
++		unsigned int k = 0;
++		while (key[k] && cmdline[i + k] == key[k]) {
++			k++;
++		}
++		if (key[k]) {
++			continue;
++		}
++		unsigned int n = 0;
++		for (unsigned int j = i + k; cmdline[j] >= '0' && cmdline[j] <= '9' && n < 1000; j++) {
++			n = n * 10 + (unsigned int)(cmdline[j] - '0');
++		}
++		lilac_stop_stage = n;
++	}
++}
++
++void
++lilac_mark(unsigned int stage)
++{
++	lilac_last_stage = stage;
++	if (stage == lilac_stop_stage) {
++		lilac_reset_after(LILAC_STOP_SECS);
++	}
++}
++
++void
++lilac_fatal_reset(void)
++{
++	lilac_reset_after(LILAC_FATAL_BASE + LILAC_FATAL_STEP * (uint64_t)lilac_last_stage);
++}
++#endif /* LILAC */
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index a1f2a91..8c7e69f 100644
+index a1f2a91..41f1342 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -1087,7 +1087,7 @@ ml_parse_cpu_topology(void)
+@@ -28,6 +28,7 @@
+ 
+ #include <arm64/machine_machdep.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/sweet_early.h>
+ #include <arm/machine_cpu.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/cpuid.h>
+@@ -482,6 +483,7 @@ machine_startup(__unused boot_args * args)
+ 	}
+ #endif /* defined(HAS_IPI) && (DEVELOPMENT || DEBUG)*/
+ 
++	sweet_early_mark(21, "machine_startup");
+ 
+ 	machine_conf();
+ 
+@@ -753,6 +755,9 @@ halt_all_cpus(boolean_t reboot)
+ 		printf("CPU halted\n");
+ 		PEHaltRestart(kPEHaltCPU);
+ 	}
++#if defined(LILAC)
++	lilac_fatal_reset();
++#endif
+ 	while (1) {
+ 		;
+ 	}
+@@ -1087,7 +1092,7 @@ ml_parse_cpu_topology(void)
  		}
  #endif
  
@@ -400,10 +565,122 @@ index a1f2a91..8c7e69f 100644
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 023086f..5456fbc 100644
+index 023086f..d3cf45a 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -513,7 +513,7 @@ LEXT(start_first_cpu)
+@@ -38,6 +38,36 @@
+ 
+ #if __ARM_KERNEL_PROTECT__
+ #include <arm/pmap.h>
++
++#if defined(LILAC)
++/*
++ * No console exists on LILAC: an exception taken before the real vectors are
++ * installed waits LILAC_LOWVEC_SECS (lilac_diag.c) and then resets via PSCI
++ * SYSTEM_RESET. Stack-free and position-independent (MMU on or off).
++ */
++.macro LOW_VECTOR_TRAP
++	mrs		x0, CNTFRQ_EL0
++	mov		x1, #45
++	mul		x0, x0, x1
++	isb
++	mrs		x1, CNTPCT_EL0
++	add		x0, x0, x1
++1:
++	isb
++	mrs		x1, CNTPCT_EL0
++	cmp		x1, x0
++	b.lo	1b
++	movz	x0, #0x0009
++	movk	x0, #0x8400, lsl #16
++	dsb		sy
++	smc		#0
++	b		.
++.endm
++#else
++.macro LOW_VECTOR_TRAP
++	b		.
++.endm
++#endif
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
+ 
+@@ -114,13 +144,13 @@ LEXT(LowResetVectorBase)
+ 
+ 	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
+ 	.align	9
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 
+ 	.align	7
+ 	.globl EXT(reset_vector)
+@@ -233,40 +263,40 @@ LEXT(_start)
+ 	.global	EXT(LowExceptionVectorBase)
+ LEXT(LowExceptionVectorBase)
+ 	/* EL1 SP 0 */
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	/* EL1 SP1 */
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	/* EL0 64 */
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	/* EL0 32 */
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align	7
+-	b		.
++	LOW_VECTOR_TRAP
+ 	.align 12, 0
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+@@ -513,7 +543,7 @@ LEXT(start_first_cpu)
  	mov		x20, x0
  	mov		x21, #0
  
@@ -412,7 +689,7 @@ index 023086f..5456fbc 100644
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
  	mov		w1, #-1
-@@ -678,7 +678,7 @@ Lkernelcache_base_found:
+@@ -678,7 +708,7 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -435,10 +712,10 @@ index 6928957..44a87a1 100644
  #include <kern/misc_protos.h>
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..ef60b91 100644
+index d7a25f2..e64b9df 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -6,7 +6,7 @@
+@@ -6,12 +6,26 @@
  #include <stdarg.h>
  #include <stdint.h>
  
@@ -447,11 +724,42 @@ index d7a25f2..ef60b91 100644
  void sweet_early_mark(unsigned int stage, const char *label);
  void sweet_early_putc(char c);
  void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++#elif defined(LILAC)
++/*
++ * LILAC has no serial port and no visible early framebuffer, so boot progress
++ * is reported through the delay before a PSCI SYSTEM_RESET (lilac_diag.c).
++ */
++void lilac_diag_init(const char *cmdline);
++void lilac_mark(unsigned int stage);
++void lilac_fatal_reset(void);
++static inline void sweet_early_mark(unsigned int stage, const char *label)
++{
++	(void)label;
++	lilac_mark(stage);
++}
++static inline void sweet_early_disable(void) {}
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..05530f8 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/lilac_diag.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 437adb1..3885f23 100644
+index 437adb1..06f23cd 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -1072,7 +1072,7 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -1072,10 +1072,14 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  {
  #pragma clang diagnostic pop
  
@@ -459,6 +767,46 @@ index 437adb1..3885f23 100644
 +#if defined(SWEET_EARLY_FB)
  	/* No CPU/thread/debugger state is required for this first panic copy. */
  	sweet_early_panic(panic_format_str, panic_args);
+ #endif
++#if defined(LILAC)
++	/* No console exists to report the panic; encode it as a timed reset. */
++	lilac_fatal_reset();
++#endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..82c8466 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -148,6 +148,12 @@
+ #include <arm64/alternate_debugger.h>
+ #endif
+ 
++#if defined(__arm64__)
++#include <arm64/sweet_early.h>
++#else
++#define sweet_early_mark(stage, label) do { } while (0)
++#endif
++
+ #if MACH_KDP
+ #include <kdp/kdp.h>
+ #endif
+@@ -426,6 +432,7 @@ kernel_bootstrap(void)
+ 	thread_t        thread;
+ 	char            namep[16];
+ 
++	sweet_early_mark(22, "kernel_bootstrap");
+ 	printf("%s\n", version); /* log kernel version */
+ 
+ 	scale_setup();
+@@ -786,6 +793,7 @@ kernel_bootstrap_thread(void)
+ 	/*
+ 	 *	Start the user bootstrap.
+ 	 */
++	sweet_early_mark(24, "calling bsd_init");
+ #ifdef  MACH_BSD
+ 	bsd_init();
  #endif
 diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
 index 182b44a..202e658 100644
