@@ -656,17 +656,17 @@ index a1f2a91..41f1342 100644
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 24f1abc..0f2064a 100644
+index 24f1abc..e0394f2 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -83,6 +83,7 @@
- 
+@@ -84,6 +84,7 @@
  #if CONFIG_UBSAN_MINIMAL
  #include <san/ubsan_minimal.h>
-+#include <arm64/sweet_early.h>
  #endif /* CONFIG_UBSAN_MINIMAL */
++#include <arm64/sweet_early.h>
  
  
+ #ifndef __arm64__
 @@ -1868,6 +1869,9 @@ sleh_irq(arm_saved_state_t *state)
  		return; /* spurious */
  	}
