@@ -434,7 +434,7 @@ index 06bb568..987bc88 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..d75ed08
+index 0000000..8ab4f1e
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
 @@ -0,0 +1,87 @@
@@ -467,7 +467,7 @@ index 0000000..d75ed08
 +lilac_counter(void)
 +{
 +	uint64_t v;
-+	__asm__ volatile ("isb\n\tmrs %0, CNTPCT_EL0" : "=r"(v) :: "memory");
++	__asm__ volatile ("isb\n\tmrs %0, CNTVCT_EL0" : "=r"(v) :: "memory");
 +	return v;
 +}
 +
@@ -565,10 +565,10 @@ index a1f2a91..41f1342 100644
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 023086f..1106faa 100644
+index 023086f..3d585d0 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -38,8 +38,39 @@
+@@ -38,8 +38,40 @@
  
  #if __ARM_KERNEL_PROTECT__
  #include <arm/pmap.h>
@@ -579,18 +579,19 @@ index 023086f..1106faa 100644
 +/*
 + * No console exists on LILAC: an exception taken before the real vectors are
 + * installed waits 45 s (see lilac_diag.c) and then resets via PSCI
-+ * SYSTEM_RESET. Stack-free and position-independent (MMU on or off).
++ * SYSTEM_RESET. Stack-free and position-independent (MMU on or off). Uses the
++ * virtual counter, which EL1 can read under the Qualcomm hypervisor (G1-G3).
 + */
 +.macro LOW_VECTOR_TRAP
 +	mrs		x0, CNTFRQ_EL0
 +	mov		x1, #45
 +	mul		x0, x0, x1
 +	isb
-+	mrs		x1, CNTPCT_EL0
++	mrs		x1, CNTVCT_EL0
 +	add		x0, x0, x1
 +1:
 +	isb
-+	mrs		x1, CNTPCT_EL0
++	mrs		x1, CNTVCT_EL0
 +	cmp		x1, x0
 +	b.lo	1b
 +	movz	x0, #0x0009
@@ -608,7 +609,7 @@ index 023086f..1106faa 100644
  
  
  .macro MSR_VBAR_EL1_X0
-@@ -114,13 +145,13 @@ LEXT(LowResetVectorBase)
+@@ -114,13 +146,13 @@ LEXT(LowResetVectorBase)
  
  	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
  	.align	9
@@ -626,7 +627,7 @@ index 023086f..1106faa 100644
  
  	.align	7
  	.globl EXT(reset_vector)
-@@ -233,40 +264,40 @@ LEXT(_start)
+@@ -233,40 +265,40 @@ LEXT(_start)
  	.global	EXT(LowExceptionVectorBase)
  LEXT(LowExceptionVectorBase)
  	/* EL1 SP 0 */
@@ -683,7 +684,7 @@ index 023086f..1106faa 100644
  	.align 12, 0
  
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
-@@ -513,7 +544,7 @@ LEXT(start_first_cpu)
+@@ -513,7 +545,7 @@ LEXT(start_first_cpu)
  	mov		x20, x0
  	mov		x21, #0
  
@@ -692,7 +693,7 @@ index 023086f..1106faa 100644
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
  	mov		w1, #-1
-@@ -678,7 +709,7 @@ Lkernelcache_base_found:
+@@ -678,7 +710,7 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
