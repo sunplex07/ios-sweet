@@ -59,10 +59,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..c15f978
+index 0000000..86fe426
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,793 @@
+@@ -0,0 +1,976 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -106,6 +106,7 @@ index 0000000..c15f978
 +#include <machine/machine_routines.h>
 +#include <libkern/libkern.h>
 +#include <machine/atomic.h>
++#include <libkern/crc.h>
 +#include <arm64/sweet_early.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as bsd/dev/sweet_ufs.c */
@@ -139,7 +140,9 @@ index 0000000..c15f978
 +#define INT_ERROR       (1u << 15)
 +#define INT_ERR_MASK    0xFFFF0000u
 +
++#define XFER_BLKCNT_EN  (1u << 1)
 +#define XFER_READ       (1u << 4)
++#define XFER_MULTI      (1u << 5)
 +#define CMD_RESP48      0x02
 +#define CMD_RESP48_BUSY 0x03
 +#define CMD_TYPE_ABORT  (3u << 6)
@@ -151,6 +154,7 @@ index 0000000..c15f978
 +#define RESET_DAT       (1u << 26)
 +
 +#define SD_BLOCK        512u
++#define SD_MULTI_MAX    128u            /* blocks per CMD18 (64 KiB) */
 +
 +static vm_offset_t sd_regs;
 +
@@ -266,6 +270,97 @@ index 0000000..c15f978
 +}
 +
 +/*
++ * CMD12 STOP_TRANSMISSION (R1b), as UEFI SdccDxe ends its multi-block reads on
++ * this controller (G17-SDP: last command CMD12). Returns 0 once the card has
++ * released DAT0.
++ */
++static int
++sd_stop_transmission(uint32_t *stp)
++{
++	uint64_t end = sd_deadline(100000);
++	while (sd_rd(HC_PRESENT) & PS_CMD_INHIBIT) {
++		if (mach_absolute_time() > end) {
++			return EBUSY;
++		}
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	sd_wr(HC_ARG, 0);
++	sd_wr(HC_XFER_CMD, (12u << 8 | CMD_TYPE_ABORT | CMD_IDX_CHECK | CMD_CRC_CHECK | CMD_RESP48_BUSY) << 16);
++	int error = sd_wait_int(INT_CMD_DONE, 100000, stp);
++	if (!error) {
++		/* R1b: transfer complete marks the end of the busy signal. */
++		error = sd_wait_int(INT_XFER_DONE, 1000000, stp);
++	}
++	return error;
++}
++
++/*
++ * CMD18 for n (2..SD_MULTI_MAX) consecutive 512-byte blocks, polled PIO, then
++ * an explicit CMD12. Read-only: no write command can be issued from here.
++ */
++static int
++sd_read_multi_hw(uint32_t lba, uint32_t n, uint8_t *buf, uint32_t *stp)
++{
++	uint32_t st = 0;
++	*stp = 0;
++	if (n < 2 || n > SD_MULTI_MAX) {
++		return EINVAL;
++	}
++	uint64_t end = sd_deadline(100000);
++	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
++		if (mach_absolute_time() > end) {
++			return EBUSY;
++		}
++	}
++	if ((sd_rd(HC_INT_ENABLE) & (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) != (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) {
++		sd_wr(HC_INT_ENABLE, INT_ENABLE_UEFI);
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	sd_wr(HC_BLKSZ_CNT, (n << 16) | SD_BLOCK);
++	sd_wr(HC_ARG, lba);
++	sd_wr(HC_XFER_CMD, ((18u << 8 | CMD_DATA | CMD_IDX_CHECK | CMD_CRC_CHECK | CMD_RESP48) << 16) |
++	    XFER_MULTI | XFER_READ | XFER_BLKCNT_EN);
++
++	int error = sd_wait_int(INT_CMD_DONE, 100000, &st);
++	if (!error && (sd_rd(HC_RESP0) & R1_ERRORS)) {
++		st = sd_rd(HC_RESP0);
++		error = ERANGE;
++	}
++	if (!error) {
++		sd_wr(HC_INT_STATUS, INT_CMD_DONE);
++	}
++	for (uint32_t b = 0; !error && b < n; b++) {
++		error = sd_wait_int(INT_BUF_RD, 500000, &st);
++		if (error) {
++			break;
++		}
++		sd_wr(HC_INT_STATUS, INT_BUF_RD);
++		uint8_t *p = buf + b * SD_BLOCK;
++		for (uint32_t i = 0; i < SD_BLOCK; i += 4) {
++			uint32_t w = sd_rd(HC_BUFFER);
++			p[i] = (uint8_t)w;
++			p[i + 1] = (uint8_t)(w >> 8);
++			p[i + 2] = (uint8_t)(w >> 16);
++			p[i + 3] = (uint8_t)(w >> 24);
++		}
++	}
++	if (!error) {
++		error = sd_wait_int(INT_XFER_DONE, 500000, &st);
++	}
++	/* Always end the open-ended read, also after an error, so the card returns to tran. */
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	uint32_t st12 = 0;
++	int stop = sd_stop_transmission(&st12);
++	if (error || stop) {
++		*stp = error ? st : st12;
++		sd_reset_lines();
++		return error ? error : stop;
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	return 0;
++}
++
++/*
 + * One controller transaction at a time. Interrupts stay enabled (a polled
 + * transfer can take far longer than the 35 ms interrupt-masked limit of
 + * DEVELOPMENT kernels), so a transaction can be preempted. Thread-context
@@ -306,6 +401,89 @@ index 0000000..c15f978
 +	return error;
 +}
 +
++/* n consecutive blocks; CMD18 for runs of 2+, CMD17 for a single block. */
++static int
++sd_read_blocks(uint32_t lba, uint32_t n, uint8_t *buf)
++{
++	uint32_t st;
++	int error = 0;
++	while (n && !error) {
++		uint32_t k = MIN(n, SD_MULTI_MAX);
++		(void)sd_claim(true);
++		error = (k == 1) ? sd_read_block_hw(lba, buf, &st) : sd_read_multi_hw(lba, k, buf, &st);
++		sd_release();
++		if (error) {
++			printf("LILAC SD: CMD%u lba 0x%x n %u failed %d, int 0x%08x\n", k == 1 ? 17 : 18, lba, k, error, st);
++		}
++		lba += k;
++		buf += k * SD_BLOCK;
++		n -= k;
++	}
++	return error;
++}
++
++/*
++ * Stage 69: CMD18 self-check on the first 4 MiB of MBR partition 2 (the
++ * G15 getpid.hfs image, CRC32 0x794a64d2). bit0 all CMD18 reads succeeded,
++ * bit1 CRC32 matches, bit2 the first 64 KiB equal CMD17 reads of the same
++ * blocks, bit3 CMD18 at least 4x faster than CMD17 over those 64 KiB.
++ */
++#define SD69_BYTES      (4u << 20)
++#define SD69_CRC        0x794a64d2u
++
++static void
++lilac_sd_multi_check(void)
++{
++	static uint8_t chunk[SD_MULTI_MAX * SD_BLOCK], single[SD_MULTI_MAX * SD_BLOCK];
++	unsigned int nib = 0;
++	uint32_t crc = 0, first;
++	uint64_t t0, t1, t2, multi_ns = 0, single_ns = 0;
++	bool ok = true;
++
++	sd_map();
++	if (sd_read_blocks(0, 1, chunk) || chunk[510] != 0x55 || chunk[511] != 0xAA || chunk[446 + 16 + 4] != 0xAF) {
++		lilac_report(69, 0);
++		return;
++	}
++	first = chunk[446 + 16 + 8] | chunk[446 + 16 + 9] << 8 | chunk[446 + 16 + 10] << 16 | (uint32_t)chunk[446 + 16 + 11] << 24;
++	t0 = mach_absolute_time();
++	for (uint32_t off = 0; off < SD69_BYTES && ok; off += sizeof(chunk)) {
++		ok = sd_read_blocks(first + off / SD_BLOCK, SD_MULTI_MAX, chunk) == 0;
++		if (ok) {
++			crc = crc32(crc, chunk, sizeof(chunk));
++		}
++	}
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &multi_ns);
++	if (ok) {
++		nib |= 1;
++		if (crc == SD69_CRC) {
++			nib |= 2;
++		}
++		/* Same 64 KiB both ways. */
++		t0 = mach_absolute_time();
++		ok = sd_read_blocks(first, SD_MULTI_MAX, chunk) == 0;
++		t1 = mach_absolute_time();
++		for (uint32_t b = 0; ok && b < SD_MULTI_MAX; b++) {
++			ok = sd_read_blocks(first + b, 1, single + b * SD_BLOCK) == 0;
++		}
++		t2 = mach_absolute_time();
++		uint64_t m64 = 0;
++		absolutetime_to_nanoseconds(t1 - t0, &m64);
++		absolutetime_to_nanoseconds(t2 - t1, &single_ns);
++		if (ok && memcmp(chunk, single, sizeof(chunk)) == 0) {
++			nib |= 4;
++		}
++		if (ok && m64 * 4 <= single_ns) {
++			nib |= 8;
++		}
++		printf("LILAC SD: CMD18 check: 4 MiB in %llu us (%llu KiB/s), crc32 0x%08x; 64 KiB: CMD18 %llu us, CMD17 %llu us\n",
++		    multi_ns / 1000, multi_ns ? (4096ull * 1000000000ull) / multi_ns : 0, crc, m64 / 1000, single_ns / 1000);
++	}
++	printf("LILAC SD: CMD18 check nibble 0x%x\n", nib);
++	lilac_report(69, nib);
++}
++
 +void lilac_sd_probe(void);
 +
 +void
@@ -317,6 +495,9 @@ index 0000000..c15f978
 +	} t[] = { { 65, 0 }, { 66, 2048 }, { 67, 0x8000000 } };
 +	static uint8_t blk[SD_BLOCK];
 +
++	if (lilac_stop_is(69)) {
++		lilac_sd_multi_check();
++	}
 +	for (unsigned int i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
 +		if (!lilac_stop_is(t[i].stage)) {
 +			continue;
@@ -352,7 +533,7 @@ index 0000000..c15f978
 +	uint32_t secsize;       /* logical sector size presented to BSD */
 +	int      bmajor, cmajor;
 +	dev_t    bdev;
-+	uint8_t  bounce[SD_BLOCK];
++	uint8_t  bounce[SD_MULTI_MAX * SD_BLOCK];
 +} sdd;
 +
 +static int
@@ -396,14 +577,16 @@ index 0000000..c15f978
 +		goto done;
 +	}
 +	lck_mtx_lock(&lilac_sd_lock);
-+	for (uint32_t done = 0; done < count; done += SD_BLOCK) {
++	for (uint32_t done = 0; done < count;) {
++		uint32_t k = MIN((count - done) / SD_BLOCK, SD_MULTI_MAX);
 +		uint64_t lba = (off + done) / SD_BLOCK;
-+		error = sd_read_block(sdd.first + (uint32_t)lba, sdd.bounce);
++		error = sd_read_blocks(sdd.first + (uint32_t)lba, k, sdd.bounce);
 +		if (error) {
 +			break;
 +		}
-+		memcpy(vaddr + done, sdd.bounce, SD_BLOCK);
-+		buf_setresid(bp, count - done - SD_BLOCK);
++		memcpy(vaddr + done, sdd.bounce, k * SD_BLOCK);
++		done += k * SD_BLOCK;
++		buf_setresid(bp, count - done);
 +	}
 +	lck_mtx_unlock(&lilac_sd_lock);
 +	buf_unmap(bp);
@@ -450,7 +633,7 @@ index 0000000..c15f978
 +	case DKIOCSYNCHRONIZECACHE:
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
-+		*o = (128u * 1024u) / sdd.secsize;
++		*o = (SD_MULTI_MAX * SD_BLOCK) / sdd.secsize;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
 +		*o = 0;
