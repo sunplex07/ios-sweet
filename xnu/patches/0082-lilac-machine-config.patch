@@ -542,10 +542,10 @@ index 0000000..370cd48
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_ufs.c b/bsd/dev/lilac_ufs.c
 new file mode 100644
-index 0000000..94938b8
+index 0000000..b3fb907
 --- /dev/null
 +++ b/bsd/dev/lilac_ufs.c
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,410 @@
 +/*
 + * LILAC (Xperia XZ1 Compact, MSM8998): read-only UFS probe, stages 80-83.
 + *
@@ -593,6 +593,7 @@ index 0000000..94938b8
 +#if defined(ARM64_BOARD_CONFIG_LILAC)
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as bsd/dev/sweet_ufs.c */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +
 +#define UFS_PA          0x01DA4000ULL
 +#define GCC_UFS_PA      0x00175000ULL
