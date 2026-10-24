@@ -11,6 +11,18 @@ index f2d8bf8..75ab7cf 100644
  SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..86aebf7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/lilac_sd.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 index 7fd9be1..69ebbb8 100644
 --- a/bsd/dev/arm/systemcalls.c
@@ -44,6 +56,215 @@ index 7fd9be1..69ebbb8 100644
  #define unix_syscall_kprintf(x...)      /* kprintf("unix_syscall: " x) */
  
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
+diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
+new file mode 100644
+index 0000000..31f4bb4
+--- /dev/null
++++ b/bsd/dev/lilac_sd.c
+@@ -0,0 +1,203 @@
++/*
++ * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
++ *
++ * Hardware (mainline msm8998.dtsi sdhc2, qcom,sdhci-msm-v4): standard SDHCI
++ * registers at 0x0c0a4900, MSM core registers at 0x0c0a4000. No SMMU.
++ * UEFI SdccDxe leaves the card selected in transfer state, 4-bit bus, clocks
++ * running and interrupt signals off (G17-SDP register dump), so this code
++ * reuses that state: it never touches clocks, power, bus width or the card's
++ * identification, and issues only CMD17 (READ_SINGLE_BLOCK) through the PIO
++ * buffer data port. Nothing is ever written to the card.
++ *
++ * Probe (bsd_init, only when lilac_stop is 65, 66 or 67):
++ *   65: read LBA 0          expect nibble 0xF
++ *   66: read LBA 2048       FAT32 boot sector: nibble from its bytes (see EXPERIMENTS.md G17)
++ *   67: read LBA 0x8000000  past the end of the card: expect nibble 0x0
++ * nibble bit0 = CMD17 completed without error, bit1 = 0x55AA signature,
++ * bit2 = partition 1 type 0x0C (FAT32 LBA), bit3 = partition 1 starts at 2048.
++ */
++#if defined(ARM64_BOARD_CONFIG_LILAC)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <arm64/sweet_early.h>
++
++#define SD_MAP_PA       0x0c0a4000ULL   /* MSM core; SDHCI at +0x900 */
++#define SD_MAP_SIZE     0x1000
++#define SD_HC           0x900
++
++/* SDHCI standard registers (offsets from SD_HC) */
++#define HC_BLKSZ_CNT    0x04            /* [15:0] block size, [31:16] block count */
++#define HC_ARG          0x08
++#define HC_XFER_CMD     0x0C            /* [15:0] transfer mode, [31:16] command */
++#define HC_RESP0        0x10
++#define HC_BUFFER       0x20
++#define HC_PRESENT      0x24
++#define HC_RESET        0x2C            /* byte 3 (0x2F): software reset */
++#define HC_INT_STATUS   0x30            /* [15:0] normal, [31:16] error */
++#define HC_INT_ENABLE   0x34            /* status enables (latching), not IRQ signals */
++#define INT_ENABLE_UEFI 0x07FF803Fu     /* value UEFI SdccDxe leaves (G17-SDP) */
++#define R1_ERRORS       0xFDF90008u     /* R1 card-status error bits */
++
++#define PS_CMD_INHIBIT  (1u << 0)
++#define PS_DAT_INHIBIT  (1u << 1)
++
++#define INT_CMD_DONE    (1u << 0)
++#define INT_XFER_DONE   (1u << 1)
++#define INT_BUF_RD      (1u << 5)
++#define INT_ERROR       (1u << 15)
++#define INT_ERR_MASK    0xFFFF0000u
++
++#define XFER_READ       (1u << 4)
++#define CMD_RESP48      0x02
++#define CMD_CRC_CHECK   (1u << 3)
++#define CMD_IDX_CHECK   (1u << 4)
++#define CMD_DATA        (1u << 5)
++
++#define RESET_CMD       (1u << 25)      /* bits of the 32-bit word at 0x2C */
++#define RESET_DAT       (1u << 26)
++
++#define SD_BLOCK        512u
++
++static vm_offset_t sd_regs;
++
++static inline uint32_t
++sd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sd_regs + SD_HC + off);
++}
++
++static inline void
++sd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(sd_regs + SD_HC + off) = v;
++}
++
++static uint64_t
++sd_deadline(uint32_t usec)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)usec * 1000, &abs);
++	return mach_absolute_time() + abs;
++}
++
++/* Wait until any bit of want is set in the interrupt status, or an error. */
++static int
++sd_wait_int(uint32_t want, uint32_t usec, uint32_t *status)
++{
++	uint64_t end = sd_deadline(usec);
++	for (;;) {
++		uint32_t s = sd_rd(HC_INT_STATUS);
++		if (s & (INT_ERROR | INT_ERR_MASK)) {
++			*status = s;
++			return EIO;
++		}
++		if (s & want) {
++			*status = s;
++			return 0;
++		}
++		if (mach_absolute_time() > end) {
++			*status = s;
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/* Software reset of the CMD and DAT state machines after an error (card state untouched). */
++static void
++sd_reset_lines(void)
++{
++	uint32_t v = sd_rd(HC_RESET);
++	sd_wr(HC_RESET, v | RESET_CMD | RESET_DAT);
++	uint64_t end = sd_deadline(100000);
++	while ((sd_rd(HC_RESET) & (RESET_CMD | RESET_DAT)) && mach_absolute_time() < end) {
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++}
++
++/* CMD17 for one 512-byte block (SDHC/SDXC block addressing), polled PIO. */
++static int
++sd_read_block(uint32_t lba, uint8_t *buf)
++{
++	uint32_t st;
++	uint64_t end = sd_deadline(100000);
++	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
++		if (mach_absolute_time() > end) {
++			return EBUSY;
++		}
++	}
++	if ((sd_rd(HC_INT_ENABLE) & (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) != (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) {
++		sd_wr(HC_INT_ENABLE, INT_ENABLE_UEFI);
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	sd_wr(HC_BLKSZ_CNT, (1u << 16) | SD_BLOCK);
++	sd_wr(HC_ARG, lba);
++	sd_wr(HC_XFER_CMD, ((17u << 8 | CMD_DATA | CMD_IDX_CHECK | CMD_CRC_CHECK | CMD_RESP48) << 16) | XFER_READ);
++
++	int error = sd_wait_int(INT_CMD_DONE, 100000, &st);
++	if (!error && (sd_rd(HC_RESP0) & R1_ERRORS)) {
++		st = sd_rd(HC_RESP0);
++		error = ERANGE;
++	}
++	if (!error) {
++		sd_wr(HC_INT_STATUS, INT_CMD_DONE);
++		error = sd_wait_int(INT_BUF_RD, 500000, &st);
++	}
++	if (!error) {
++		sd_wr(HC_INT_STATUS, INT_BUF_RD);
++		for (uint32_t i = 0; i < SD_BLOCK; i += 4) {
++			uint32_t w = sd_rd(HC_BUFFER);
++			buf[i] = (uint8_t)w;
++			buf[i + 1] = (uint8_t)(w >> 8);
++			buf[i + 2] = (uint8_t)(w >> 16);
++			buf[i + 3] = (uint8_t)(w >> 24);
++		}
++		error = sd_wait_int(INT_XFER_DONE, 500000, &st);
++	}
++	if (error) {
++		printf("LILAC SD: CMD17 lba 0x%x failed %d, int 0x%08x, present 0x%08x\n",
++		    lba, error, st, sd_rd(HC_PRESENT));
++		sd_reset_lines();
++		return error;
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	return 0;
++}
++
++void lilac_sd_probe(void);
++
++void
++lilac_sd_probe(void)
++{
++	static const struct {
++		unsigned int stage;
++		uint32_t lba;
++	} t[] = { { 65, 0 }, { 66, 2048 }, { 67, 0x8000000 } };
++	static uint8_t blk[SD_BLOCK];
++
++	for (unsigned int i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
++		if (!lilac_stop_is(t[i].stage)) {
++			continue;
++		}
++		sd_regs = ml_io_map(SD_MAP_PA, SD_MAP_SIZE);
++		unsigned int nib = 0;
++		if (sd_read_block(t[i].lba, blk) == 0) {
++			nib |= 1;
++			if (blk[510] == 0x55 && blk[511] == 0xAA) {
++				nib |= 2;
++			}
++			if (blk[446 + 4] == 0x0C) {
++				nib |= 4;
++			}
++			if ((blk[446 + 8] | blk[446 + 9] << 8 | blk[446 + 10] << 16 | (uint32_t)blk[446 + 11] << 24) == 2048) {
++				nib |= 8;
++			}
++		}
++		printf("LILAC SD: probe stage %u lba 0x%x nibble 0x%x\n", t[i].stage, t[i].lba, nib);
++		lilac_report(t[i].stage, nib);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
 index 1981490..faecc9b 100644
 --- a/bsd/dev/sweet_spmi.c
@@ -101,7 +322,7 @@ index 6b926fe..ab150b7 100644
  		int error = sweet_ufs_init();
  		if (error) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..ca08527 100644
+index bb2a2bf..a124a64 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -164,6 +164,11 @@
@@ -116,7 +337,7 @@ index bb2a2bf..ca08527 100644
  #include <sys/kern_overrides.h>         /* for init_system_override() */
  #include <sys/lockf.h>                  /* for lf_init() */
  #include <sys/fsctl.h>
-@@ -685,7 +690,18 @@ bsd_init(void)
+@@ -685,7 +690,23 @@ bsd_init(void)
  	 * Initialize the calendar.
  	 */
  	bsd_init_kprintf("calling IOKitInitializeTime\n");
@@ -131,11 +352,16 @@ index bb2a2bf..ca08527 100644
 +		clock_get_calendar_microtime(&lsecs, &lusecs);
 +		lilac_report(64, (unsigned int)((lsecs / 86400) % 16));
 +	}
++	{
++		/* Stages 65-67: read-only microSD probe (bsd/dev/lilac_sd.c). */
++		extern void lilac_sd_probe(void);
++		lilac_sd_probe();
++	}
 +#endif
  
  	/* Initialize the file systems. */
  	bsd_init_kprintf("calling vfsinit\n");
-@@ -874,11 +890,13 @@ bsd_init(void)
+@@ -874,11 +895,13 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling setconf\n");
  		setconf();
@@ -149,7 +375,7 @@ index bb2a2bf..ca08527 100644
  		if (0 == (err = vfs_mountroot())) {
  			break;
  		}
-@@ -1098,6 +1116,7 @@ bsdinit_task(void)
+@@ -1098,6 +1121,7 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
