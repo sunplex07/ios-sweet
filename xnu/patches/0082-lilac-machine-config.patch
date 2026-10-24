@@ -59,10 +59,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..370cd48
+index 0000000..790eff4
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,762 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -104,6 +104,7 @@ index 0000000..370cd48
 +#include <pexpert/pexpert.h>
 +#include <machine/machine_routines.h>
 +#include <libkern/libkern.h>
++#include <machine/atomic.h>
 +#include <arm64/sweet_early.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as bsd/dev/sweet_ufs.c */
@@ -130,7 +131,9 @@ index 0000000..370cd48
 +
 +#define INT_CMD_DONE    (1u << 0)
 +#define INT_XFER_DONE   (1u << 1)
++#define INT_BUF_WR      (1u << 4)
 +#define INT_BUF_RD      (1u << 5)
++#define PS_WRITABLE     (1u << 19)      /* write-protect pin: 1 = writable */
 +#define INT_ERROR       (1u << 15)
 +#define INT_ERR_MASK    0xFFFF0000u
 +
@@ -209,11 +212,15 @@ index 0000000..370cd48
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
 +}
 +
-+/* CMD17 for one 512-byte block (SDHC/SDXC block addressing), polled PIO. */
++/*
++ * CMD17 for one 512-byte block (SDHC/SDXC block addressing), polled PIO.
++ * Runs with interrupts disabled (sd_read_block), so it must not printf.
++ */
 +static int
-+sd_read_block(uint32_t lba, uint8_t *buf)
++sd_read_block_hw(uint32_t lba, uint8_t *buf, uint32_t *stp)
 +{
-+	uint32_t st;
++	uint32_t st = 0;
++	*stp = 0;
 +	uint64_t end = sd_deadline(100000);
 +	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
 +		if (mach_absolute_time() > end) {
@@ -249,13 +256,53 @@ index 0000000..370cd48
 +		error = sd_wait_int(INT_XFER_DONE, 500000, &st);
 +	}
 +	if (error) {
-+		printf("LILAC SD: CMD17 lba 0x%x failed %d, int 0x%08x, present 0x%08x\n",
-+		    lba, error, st, sd_rd(HC_PRESENT));
++		*stp = st;
 +		sd_reset_lines();
 +		return error;
 +	}
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
 +	return 0;
++}
++
++/*
++ * One controller transaction at a time: claimed with interrupts disabled, so
++ * nothing on this CPU interleaves with it. The reset-time log flush does not
++ * wait for it (a fault inside a transaction must not deadlock the reset).
++ */
++static uint32_t _Atomic sd_busy;
++
++static bool
++sd_claim(boolean_t *intr, bool wait)
++{
++	*intr = ml_set_interrupts_enabled(FALSE);
++	while (!os_atomic_cmpxchg(&sd_busy, 0u, 1u, acquire)) {
++		if (!wait) {
++			(void)ml_set_interrupts_enabled(*intr);
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++sd_release(boolean_t intr)
++{
++	os_atomic_store(&sd_busy, 0u, release);
++	(void)ml_set_interrupts_enabled(intr);
++}
++
++static int
++sd_read_block(uint32_t lba, uint8_t *buf)
++{
++	uint32_t st;
++	boolean_t intr;
++	(void)sd_claim(&intr, true);
++	int error = sd_read_block_hw(lba, buf, &st);
++	sd_release(intr);
++	if (error && intr) {
++		printf("LILAC SD: CMD17 lba 0x%x failed %d, int 0x%08x\n", lba, error, st);
++	}
++	return error;
 +}
 +
 +void lilac_sd_probe(void);
@@ -538,6 +585,244 @@ index 0000000..370cd48
 +	}
 +	*dev = sdd.bdev;
 +	return 0;
++}
++
++/*
++ * ---- step 3: kernel console log on a dedicated SD partition ("sdlog") ----
++ *
++ * All console output is kept in the 4 MiB ring of sweet_ufs.c (_cnputs). It
++ * is copied to an MBR partition of type 0xDA, but only if the host armed that
++ * partition: its block 0 must hold "LILAC-SDLOG-ARM1" and the partition's own
++ * first LBA and length (u32 LE at bytes 16 and 20). The partition must not
++ * overlap the MBR area or any other partition. Layout:
++ *   block 0  arm block (written by the host, never by the kernel)
++ *   block 1  header: "LILACLOG", u32 version 1, u32 ring size, u64 bytes
++ *            written, u64 flush sequence, u64 boot UTC seconds, u32 boot
++ *            microseconds, u32 reason (0 periodic, 1 at reset)
++ *   block 2+ ring; console byte n is at ring offset n % ring size
++ * Every write goes through sd_write_block_hw(), which refuses any LBA outside
++ * blocks 1.. of the armed partition. A thread flushes every 5 s and
++ * lilac_diag.c calls a final flush inside every timed reset (stage report,
++ * fatal reset, panic). Boot-arg sdlog=0 disables it.
++ */
++#define SDLOG_TYPE      0xDA
++#define SDLOG_SECS      5
++#define SDLOG_RING_LBA  2u
++
++extern uint32_t sweet_log_ring_size(void);
++extern void sweet_log_ring_read(uint32_t off, char *out, uint32_t n);
++extern uint64_t sweet_log_position(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++static struct {
++	bool     armed;
++	uint32_t first, nblocks, ring_size;
++	uint64_t flushed, seq;
++	clock_sec_t boot_sec;
++	clock_usec_t boot_usec;
++	uint8_t  buf[SD_BLOCK], hook_buf[SD_BLOCK];
++} sl;
++
++struct sdlog_header {
++	char     magic[8];
++	uint32_t version, ring_size;
++	uint64_t total, seq, boot_sec;
++	uint32_t boot_usec, reason;
++};
++
++/* CMD24 for one 512-byte block, polled PIO; only blocks 1.. of the armed log partition. */
++static int
++sd_write_block_hw(uint32_t lba, const uint8_t *buf, uint32_t *stp)
++{
++	uint32_t st = 0;
++	*stp = 0;
++	if (!sl.armed || lba <= sl.first || lba - sl.first >= sl.nblocks) {
++		return EPERM;
++	}
++	if (!(sd_rd(HC_PRESENT) & PS_WRITABLE)) {
++		return EROFS;
++	}
++	uint64_t end = sd_deadline(100000);
++	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
++		if (mach_absolute_time() > end) {
++			return EBUSY;
++		}
++	}
++	if ((sd_rd(HC_INT_ENABLE) & (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_WR)) != (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_WR)) {
++		sd_wr(HC_INT_ENABLE, INT_ENABLE_UEFI);
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	sd_wr(HC_BLKSZ_CNT, (1u << 16) | SD_BLOCK);
++	sd_wr(HC_ARG, lba);
++	/* Transfer mode 0: single block, host to card, no DMA. */
++	sd_wr(HC_XFER_CMD, (24u << 8 | CMD_DATA | CMD_IDX_CHECK | CMD_CRC_CHECK | CMD_RESP48) << 16);
++
++	int error = sd_wait_int(INT_CMD_DONE, 100000, &st);
++	if (!error && (sd_rd(HC_RESP0) & R1_ERRORS)) {
++		st = sd_rd(HC_RESP0);
++		error = ERANGE;
++	}
++	if (!error) {
++		sd_wr(HC_INT_STATUS, INT_CMD_DONE);
++		error = sd_wait_int(INT_BUF_WR, 500000, &st);
++	}
++	if (!error) {
++		sd_wr(HC_INT_STATUS, INT_BUF_WR);
++		for (uint32_t i = 0; i < SD_BLOCK; i += 4) {
++			sd_wr(HC_BUFFER, buf[i] | buf[i + 1] << 8 | buf[i + 2] << 16 | (uint32_t)buf[i + 3] << 24);
++		}
++		/* Transfer complete for a write is signalled after the card's busy ends. */
++		error = sd_wait_int(INT_XFER_DONE, 1000000, &st);
++	}
++	if (error) {
++		*stp = st;
++		sd_reset_lines();
++		return error;
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	return 0;
++}
++
++static int
++sd_write_block(uint32_t lba, const uint8_t *buf, bool wait)
++{
++	uint32_t st;
++	boolean_t intr;
++	if (!sd_claim(&intr, wait)) {
++		return EBUSY;
++	}
++	int error = sd_write_block_hw(lba, buf, &st);
++	sd_release(intr);
++	return error;
++}
++
++/* Copy console bytes not yet on the card, then the header. */
++static int
++sdlog_flush(uint8_t *buf, uint64_t deadline, uint32_t reason)
++{
++	bool wait = (reason == 0);
++	uint64_t total = sweet_log_position();
++	uint64_t pos = (total - sl.flushed > sl.ring_size) ? total - sl.ring_size : sl.flushed;
++	int error = 0;
++
++	while (pos < total) {
++		if (deadline && mach_absolute_time() > deadline) {
++			break;
++		}
++		uint32_t off = (uint32_t)(pos % sl.ring_size);
++		off -= off % SD_BLOCK;
++		sweet_log_ring_read(off, (char *)buf, SD_BLOCK);
++		error = sd_write_block(sl.first + SDLOG_RING_LBA + off / SD_BLOCK, buf, wait);
++		if (error) {
++			return error;
++		}
++		pos = pos - pos % SD_BLOCK + SD_BLOCK;
++	}
++	uint64_t done = MIN(pos, total);
++	struct sdlog_header h = {
++		.magic = { 'L', 'I', 'L', 'A', 'C', 'L', 'O', 'G' },
++		.version = 1, .ring_size = sl.ring_size, .total = done, .seq = sl.seq + 1,
++		.boot_sec = (uint64_t)sl.boot_sec, .boot_usec = (uint32_t)sl.boot_usec, .reason = reason,
++	};
++	bzero(buf, SD_BLOCK);
++	memcpy(buf, &h, sizeof(h));
++	error = sd_write_block(sl.first + 1, buf, wait);
++	if (!error) {
++		sl.seq++;
++		sl.flushed = done;
++	}
++	return error;
++}
++
++static void
++sdlog_reset_hook(uint32_t budget_secs)
++{
++	uint64_t deadline;
++	nanoseconds_to_absolutetime((uint64_t)budget_secs * NSEC_PER_SEC, &deadline);
++	(void)sdlog_flush(sl.hook_buf, mach_absolute_time() + deadline, 1);
++}
++
++static int sdlog_chan;
++
++static void
++sdlog_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		int error = sdlog_flush(sl.buf, 0, 0);
++		if (error) {
++			lilac_reset_hook = NULL;
++			sl.armed = false;
++			printf("LILAC SDLOG: write failed (%d), log stopped\n", error);
++			return;
++		}
++		(void)tsleep(&sdlog_chan, PZERO, "sdlog", hz * SDLOG_SECS);
++	}
++}
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++void lilac_sd_log_init(void);
++
++void
++lilac_sd_log_init(void)
++{
++	uint32_t on = 1;
++	int found = -1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sdlog", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	sd_map();
++	if (sd_read_block(0, sl.buf) || sl.buf[510] != 0x55 || sl.buf[511] != 0xAA) {
++		return;
++	}
++	for (int i = 0; i < 4; i++) {
++		if (sl.buf[446 + 16 * i + 4] == SDLOG_TYPE) {
++			if (found >= 0) {
++				return;                 /* more than one log partition: refuse */
++			}
++			found = i;
++		}
++	}
++	if (found < 0) {
++		return;
++	}
++	uint32_t first = le32(sl.buf + 446 + 16 * found + 8), n = le32(sl.buf + 446 + 16 * found + 12);
++	uint32_t ring = sweet_log_ring_size();
++	if (first < 2048 || ring % SD_BLOCK || n < SDLOG_RING_LBA + ring / SD_BLOCK ||
++	    (uint64_t)first + n > UINT32_MAX) {
++		return;
++	}
++	for (int i = 0; i < 4; i++) {
++		const uint8_t *e = sl.buf + 446 + 16 * i;
++		uint32_t f = le32(e + 8), m = le32(e + 12);
++		if (i != found && e[4] != 0 && m != 0 && (uint64_t)f < (uint64_t)first + n && (uint64_t)first < (uint64_t)f + m) {
++			return;                         /* overlaps another partition */
++		}
++	}
++	if (sd_read_block(first, sl.buf) || memcmp(sl.buf, "LILAC-SDLOG-ARM1", 16) != 0 ||
++	    le32(sl.buf + 16) != first || le32(sl.buf + 20) != n) {
++		printf("LILAC SDLOG: partition %d at 0x%x is not armed\n", found + 1, first);
++		return;
++	}
++	sl.first = first;
++	sl.nblocks = n;
++	sl.ring_size = ring;
++	clock_get_calendar_microtime(&sl.boot_sec, &sl.boot_usec);
++	sl.armed = true;
++	printf("LILAC SDLOG: console log to SD partition %d (LBA 0x%x, %u blocks), ring %u KiB\n",
++	    found + 1, first, n, ring >> 10);
++	lilac_reset_hook = sdlog_reset_hook;
++	if (kernel_thread_start(sdlog_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_ufs.c b/bsd/dev/lilac_ufs.c
@@ -985,7 +1270,7 @@ index 1981490..faecc9b 100644
  		return sp_ready ? 0 : -1;
  	}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 6b926fe..ab150b7 100644
+index 6b926fe..55a4cf5 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -25,6 +25,12 @@
@@ -1001,7 +1286,32 @@ index 6b926fe..ab150b7 100644
  #include <sys/proc.h>
  #include <sys/uio.h>
  #include <miscfs/devfs/devfs.h>
-@@ -811,6 +817,10 @@ int sweet_ufs_rootdev(dev_t *dev);
+@@ -722,6 +728,24 @@ sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
+ 	return n;
+ }
+ 
++/* Raw ring bytes [off, off + n) (off + n <= ring size), for lilac_sd.c's SD log. */
++uint32_t sweet_log_ring_size(void);
++void sweet_log_ring_read(uint32_t off, char *out, uint32_t n);
++
++uint32_t
++sweet_log_ring_size(void)
++{
++	return SWEET_LOG_SIZE;
++}
++
++void
++sweet_log_ring_read(uint32_t off, char *out, uint32_t n)
++{
++	if (off <= SWEET_LOG_SIZE && n <= SWEET_LOG_SIZE - off) {
++		memcpy(out, sweet_log_ring + off, n);
++	}
++}
++
+ uint64_t sweet_log_position(void);
+ 
+ uint64_t
+@@ -811,6 +835,10 @@ int sweet_ufs_rootdev(dev_t *dev);
  int
  sweet_ufs_rootdev(dev_t *dev)
  {
@@ -1013,7 +1323,7 @@ index 6b926fe..ab150b7 100644
  		int error = sweet_ufs_init();
  		if (error) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..9cff999 100644
+index bb2a2bf..29a4220 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -164,6 +164,11 @@
@@ -1028,7 +1338,7 @@ index bb2a2bf..9cff999 100644
  #include <sys/kern_overrides.h>         /* for init_system_override() */
  #include <sys/lockf.h>                  /* for lf_init() */
  #include <sys/fsctl.h>
-@@ -685,7 +690,28 @@ bsd_init(void)
+@@ -685,7 +690,33 @@ bsd_init(void)
  	 * Initialize the calendar.
  	 */
  	bsd_init_kprintf("calling IOKitInitializeTime\n");
@@ -1044,6 +1354,11 @@ index bb2a2bf..9cff999 100644
 +		lilac_report(64, (unsigned int)((lsecs / 86400) % 16));
 +	}
 +	{
++		/* Console log to an armed SD log partition (bsd/dev/lilac_sd.c), if present. */
++		extern void lilac_sd_log_init(void);
++		lilac_sd_log_init();
++	}
++	{
 +		/* Stages 65-67: read-only microSD probe (bsd/dev/lilac_sd.c). */
 +		extern void lilac_sd_probe(void);
 +		lilac_sd_probe();
@@ -1057,7 +1372,7 @@ index bb2a2bf..9cff999 100644
  
  	/* Initialize the file systems. */
  	bsd_init_kprintf("calling vfsinit\n");
-@@ -874,11 +900,13 @@ bsd_init(void)
+@@ -874,11 +905,13 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling setconf\n");
  		setconf();
@@ -1071,7 +1386,7 @@ index bb2a2bf..9cff999 100644
  		if (0 == (err = vfs_mountroot())) {
  			break;
  		}
-@@ -1098,6 +1126,7 @@ bsdinit_task(void)
+@@ -1098,6 +1131,7 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
@@ -1670,10 +1985,10 @@ index b082a10..510b0fd 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..473451c
+index 0000000..95cb578
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,220 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -1743,12 +2058,20 @@ index 0000000..473451c
 +}
 +
 +/* Returns only if PSCI SYSTEM_RESET returns. */
++/* Run once at the start of a reset delay, inside it (lilac_sd.c SD log flush). */
++void (*volatile lilac_reset_hook)(uint32_t budget_secs);
++
 +static void
 +lilac_reset_after(uint64_t secs)
 +{
 +	uint64_t freq;
 +	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(freq));
 +	uint64_t end = lilac_counter() + secs * freq;
++	void (*hook)(uint32_t) = lilac_reset_hook;
++	if (hook != NULL && secs > 4) {
++		lilac_reset_hook = NULL;
++		hook((uint32_t)secs - 4);
++	}
 +	while (lilac_counter() < end) {
 +		__asm__ volatile ("yield");
 +	}
@@ -2109,10 +2432,10 @@ index 6928957..44a87a1 100644
  #include <kern/misc_protos.h>
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..7974131 100644
+index d7a25f2..d5201a9 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -6,12 +6,38 @@
+@@ -6,12 +6,39 @@
  #include <stdarg.h>
  #include <stdint.h>
  
@@ -2142,6 +2465,7 @@ index d7a25f2..7974131 100644
 +void lilac_wfe_poll(void);
 +void lilac_wfe_exit(void);
 +void lilac_fatal_reset(void);
++extern void (*volatile lilac_reset_hook)(uint32_t budget_secs);
 +extern volatile uint64_t lilac_wd_word;  /* watchdog mailbox, see lilac_diag.c */
 +static inline void sweet_early_mark(unsigned int stage, const char *label)
 +{
@@ -2152,7 +2476,7 @@ index d7a25f2..7974131 100644
  #else
  static inline void sweet_early_mark(unsigned int stage, const char *label)
  {
-@@ -21,4 +47,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -21,4 +48,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
  static inline void sweet_early_disable(void) {}
  #endif
  
