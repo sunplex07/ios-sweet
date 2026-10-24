@@ -101,7 +101,7 @@ index 6b926fe..ab150b7 100644
  		int error = sweet_ufs_init();
  		if (error) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..043520c 100644
+index bb2a2bf..ca08527 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -164,6 +164,11 @@
@@ -116,17 +116,26 @@ index bb2a2bf..043520c 100644
  #include <sys/kern_overrides.h>         /* for init_system_override() */
  #include <sys/lockf.h>                  /* for lf_init() */
  #include <sys/fsctl.h>
-@@ -685,7 +690,9 @@ bsd_init(void)
+@@ -685,7 +690,18 @@ bsd_init(void)
  	 * Initialize the calendar.
  	 */
  	bsd_init_kprintf("calling IOKitInitializeTime\n");
 +	sweet_early_mark(27, "IOKitInitializeTime");
  	IOKitInitializeTime();
 +	sweet_early_mark(29, "IOKitInitializeTime returned");
++#if defined(LILAC)
++	/* Stage 64: calendar after IOKitInitializeTime; nibble = (UTC day number) mod 16 (0 when unset). */
++	{
++		clock_sec_t lsecs;
++		clock_usec_t lusecs;
++		clock_get_calendar_microtime(&lsecs, &lusecs);
++		lilac_report(64, (unsigned int)((lsecs / 86400) % 16));
++	}
++#endif
  
  	/* Initialize the file systems. */
  	bsd_init_kprintf("calling vfsinit\n");
-@@ -874,11 +881,13 @@ bsd_init(void)
+@@ -874,11 +890,13 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling setconf\n");
  		setconf();
@@ -140,7 +149,7 @@ index bb2a2bf..043520c 100644
  		if (0 == (err = vfs_mountroot())) {
  			break;
  		}
-@@ -1098,6 +1107,7 @@ bsdinit_task(void)
+@@ -1098,6 +1116,7 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
