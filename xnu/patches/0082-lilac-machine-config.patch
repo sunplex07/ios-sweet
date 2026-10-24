@@ -1317,7 +1317,7 @@ index 1e7ca07..aa9ae79 100644
  	if (vm_compression_limit == 0) {
  		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..87e0ee9 100644
+index 6089db9..ddfbc8f 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -11,6 +11,9 @@
@@ -1474,7 +1474,33 @@ index 6089db9..87e0ee9 100644
  	// Mark this PE to be awake
  	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
  	if (gicr_waker & GICR_WAKER_CHILDRENASLEEP) {
-@@ -176,6 +309,9 @@ pe_init_fiq()
+@@ -165,6 +298,25 @@ pe_init_fiq()
+ 	}
+ 
+ #if defined(SWEET)
++	/*
++	 * Affinity routing must be on before the GICR SGI_base frame is programmed:
++	 * with GICD_CTLR.ARE_NS clear those registers are RAZ/WI from the non-secure
++	 * side. Android's ABL leaves ARE_NS set, but edk2's ArmGicV3Dxe ExitBootServices
++	 * handler disables the distributor by writing GICD_CTLR = 0, so a UEFI handoff
++	 * arrives with ARE_NS clear. ARE_NS may only change while the NS groups are
++	 * disabled, so set it alone first; the group enables follow below.
++	 */
++	if (!(gicd_read32(GICD_CTLR) & GICD_CTLR_ARE_NS)) {
++		gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) & ~(GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1));
++		while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++			;
++		}
++		gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ARE_NS);
++		while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++			;
++		}
++	}
++
+ 	/*
+ 	 * Real hardware with two security states: Group 0 is TrustZone's and
+ 	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+@@ -176,6 +328,9 @@ pe_init_fiq()
  		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
  	}
  	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
@@ -1484,7 +1510,7 @@ index 6089db9..87e0ee9 100644
  #else
  	// Configure timers and legacy FIQ to be group 0
  	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
-@@ -189,6 +325,11 @@ pe_init_fiq()
+@@ -189,6 +344,11 @@ pe_init_fiq()
  	icc_sre |= ICC_SRE_SRE;
  	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
  	__builtin_arm_isb(ISB_SY);
@@ -1496,7 +1522,7 @@ index 6089db9..87e0ee9 100644
  
  #if defined(SWEET)
  	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
-@@ -211,8 +352,14 @@ pe_init_fiq()
+@@ -211,8 +371,14 @@ pe_init_fiq()
  	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
  		;
  	}
