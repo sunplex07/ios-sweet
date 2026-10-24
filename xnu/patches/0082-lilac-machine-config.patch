@@ -1317,7 +1317,7 @@ index 1e7ca07..aa9ae79 100644
  	if (vm_compression_limit == 0) {
  		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..177ca0a 100644
+index 6089db9..87e0ee9 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -11,6 +11,9 @@
@@ -1330,7 +1330,7 @@ index 6089db9..177ca0a 100644
  
  
  #if HAS_GIC_V3
-@@ -73,6 +76,78 @@ find_gicr_pe_base()
+@@ -73,6 +76,133 @@ find_gicr_pe_base()
  	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
  }
  
@@ -1348,6 +1348,61 @@ index 6089db9..177ca0a 100644
 + *   73: b0 PAR(GICD) ok + Device-nGnRnE  b1 PMR>=0xF0  b2 IGRPEN1==1  b3 WAKER.ChildrenAsleep==0
 + *   74: redistributor frame index used for CPU0 (expect 0) | 8 if GICD_CTLR.ARE_NS
 + */
++/*
++ * G12 probes around the GICR SGI-frame writes (boot CPU, first pe_init_fiq call):
++ *   75 before any write: b0 ISENABLER0.17  b1 .18  b2 .26  b3 .27   (UEFI left 17,18,26,27)
++ *   76 after xnu's IGROUPR0/IPRIORITYR/ISENABLER0 writes: b0 ISENABLER0.19  b1 .1
++ *      b2 IPRIORITYR0 byte1 == 0xA0  b3 IPRIORITYR4 byte3 == 0xA0
++ *   77 then ICENABLER0 bit18 (b0: .18 cleared), ISENABLER0 bit18 + dsb (b1: .18 set),
++ *      ISENABLER0 bit1 + dsb (b2: .1 set), b3 GICR_CTLR.RWP == 0
++ *   78 before any write: b0 GICD_CTLR.EnableGrp1A  b1 GICD_CTLR.ARE_NS  b2 GICR_WAKER.ProcessorSleep
++ *      b3 GICR_WAKER.ChildrenAsleep
++ */
++#define LILAC_GICR_ICENABLER0   0x10180
++#define LILAC_GICR_IPRIORITYR4  0x10410
++#define LILAC_BIT(v, b)         (((v) >> (b)) & 1u)
++
++static void
++lilac_gic_pre(vm_offset_t gicr_pe_base)
++{
++	if (lilac_stop_is(75)) {
++		uint32_t en = gicr_read32(GICR_ISENABLER0);
++		lilac_report(75, LILAC_BIT(en, 17) | LILAC_BIT(en, 18) << 1 | LILAC_BIT(en, 26) << 2 | LILAC_BIT(en, 27) << 3);
++	}
++	if (lilac_stop_is(78)) {
++		uint32_t c = gicd_read32(GICD_CTLR), w = gicr_read32(GICR_WAKER);
++		lilac_report(78, LILAC_BIT(c, 1) | LILAC_BIT(c, 4) << 1 | LILAC_BIT(w, 1) << 2 | LILAC_BIT(w, 2) << 3);
++	}
++}
++
++static void
++lilac_gic_post_write(vm_offset_t gicr_pe_base)
++{
++	if (lilac_stop_is(76)) {
++		uint32_t en = gicr_read32(GICR_ISENABLER0);
++		uint32_t p0 = gicr_read32(GICR_IPRIORITYR0), p4 = gicr_read32(LILAC_GICR_IPRIORITYR4);
++		lilac_report(76, LILAC_BIT(en, 19) | LILAC_BIT(en, 1) << 1 |
++		    (((p0 >> 8) & 0xFF) == 0xA0) << 2 | (((p4 >> 24) & 0xFF) == 0xA0) << 3);
++	}
++	if (lilac_stop_is(77)) {
++		unsigned int n = 0;
++		gicr_write32(LILAC_GICR_ICENABLER0, 1u << 18);
++		__builtin_arm_dsb(DSB_SY);
++		while (gicr_read32(0x0) & 0x8) {
++			;
++		}
++		n |= LILAC_BIT(gicr_read32(GICR_ISENABLER0), 18) == 0;
++		gicr_write32(GICR_ISENABLER0, 1u << 18);
++		__builtin_arm_dsb(DSB_SY);
++		n |= LILAC_BIT(gicr_read32(GICR_ISENABLER0), 18) << 1;
++		gicr_write32(GICR_ISENABLER0, 1u << 1);
++		__builtin_arm_dsb(DSB_SY);
++		n |= LILAC_BIT(gicr_read32(GICR_ISENABLER0), 1) << 2;
++		n |= (LILAC_BIT(gicr_read32(0x0), 3) == 0) << 3;
++		lilac_report(77, n);
++	}
++}
++
 +static void
 +lilac_gic_probe(vm_offset_t gicr_pe_base)
 +{
@@ -1409,7 +1464,27 @@ index 6089db9..177ca0a 100644
  void
  pe_init_fiq()
  {
-@@ -189,6 +264,11 @@ pe_init_fiq()
+@@ -146,6 +276,9 @@ pe_init_fiq()
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 
++#if defined(LILAC)
++	lilac_gic_pre(gicr_pe_base);
++#endif
+ 	// Mark this PE to be awake
+ 	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
+ 	if (gicr_waker & GICR_WAKER_CHILDRENASLEEP) {
+@@ -176,6 +309,9 @@ pe_init_fiq()
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++#if defined(LILAC)
++	lilac_gic_post_write(gicr_pe_base);
++#endif
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+@@ -189,6 +325,11 @@ pe_init_fiq()
  	icc_sre |= ICC_SRE_SRE;
  	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
  	__builtin_arm_isb(ISB_SY);
@@ -1421,7 +1496,7 @@ index 6089db9..177ca0a 100644
  
  #if defined(SWEET)
  	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
-@@ -211,8 +291,14 @@ pe_init_fiq()
+@@ -211,8 +352,14 @@ pe_init_fiq()
  	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
  		;
  	}
