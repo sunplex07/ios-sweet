@@ -59,10 +59,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..790eff4
+index 0000000..c15f978
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,793 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -98,6 +98,7 @@ index 0000000..790eff4
 +#include <sys/fcntl.h>
 +#include <sys/proc.h>
 +#include <sys/uio.h>
++#include <sys/kernel.h>
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/locks.h>
 +#include <kern/clock.h>
@@ -134,11 +135,14 @@ index 0000000..790eff4
 +#define INT_BUF_WR      (1u << 4)
 +#define INT_BUF_RD      (1u << 5)
 +#define PS_WRITABLE     (1u << 19)      /* write-protect pin: 1 = writable */
++#define PS_DAT0         (1u << 20)      /* DAT[0] level; low while the card is busy programming */
 +#define INT_ERROR       (1u << 15)
 +#define INT_ERR_MASK    0xFFFF0000u
 +
 +#define XFER_READ       (1u << 4)
 +#define CMD_RESP48      0x02
++#define CMD_RESP48_BUSY 0x03
++#define CMD_TYPE_ABORT  (3u << 6)
 +#define CMD_CRC_CHECK   (1u << 3)
 +#define CMD_IDX_CHECK   (1u << 4)
 +#define CMD_DATA        (1u << 5)
@@ -212,10 +216,7 @@ index 0000000..790eff4
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
 +}
 +
-+/*
-+ * CMD17 for one 512-byte block (SDHC/SDXC block addressing), polled PIO.
-+ * Runs with interrupts disabled (sd_read_block), so it must not printf.
-+ */
++/* CMD17 for one 512-byte block (SDHC/SDXC block addressing), polled PIO. */
 +static int
 +sd_read_block_hw(uint32_t lba, uint8_t *buf, uint32_t *stp)
 +{
@@ -265,41 +266,41 @@ index 0000000..790eff4
 +}
 +
 +/*
-+ * One controller transaction at a time: claimed with interrupts disabled, so
-+ * nothing on this CPU interleaves with it. The reset-time log flush does not
-+ * wait for it (a fault inside a transaction must not deadlock the reset).
++ * One controller transaction at a time. Interrupts stay enabled (a polled
++ * transfer can take far longer than the 35 ms interrupt-masked limit of
++ * DEVELOPMENT kernels), so a transaction can be preempted. Thread-context
++ * callers wait for the controller, sleeping between attempts; the reset-time
++ * log flush, which may run in a panic or with interrupts masked, only tries
++ * once and skips its flush if a transaction is in progress.
 + */
 +static uint32_t _Atomic sd_busy;
 +
 +static bool
-+sd_claim(boolean_t *intr, bool wait)
++sd_claim(bool wait)
 +{
-+	*intr = ml_set_interrupts_enabled(FALSE);
 +	while (!os_atomic_cmpxchg(&sd_busy, 0u, 1u, acquire)) {
 +		if (!wait) {
-+			(void)ml_set_interrupts_enabled(*intr);
 +			return false;
 +		}
++		delay(100);
 +	}
 +	return true;
 +}
 +
 +static void
-+sd_release(boolean_t intr)
++sd_release(void)
 +{
 +	os_atomic_store(&sd_busy, 0u, release);
-+	(void)ml_set_interrupts_enabled(intr);
 +}
 +
 +static int
 +sd_read_block(uint32_t lba, uint8_t *buf)
 +{
 +	uint32_t st;
-+	boolean_t intr;
-+	(void)sd_claim(&intr, true);
++	(void)sd_claim(true);
 +	int error = sd_read_block_hw(lba, buf, &st);
-+	sd_release(intr);
-+	if (error && intr) {
++	sd_release();
++	if (error) {
 +		printf("LILAC SD: CMD17 lba 0x%x failed %d, int 0x%08x\n", lba, error, st);
 +	}
 +	return error;
@@ -631,6 +632,34 @@ index 0000000..790eff4
 +	uint32_t boot_usec, reason;
 +};
 +
++/*
++ * After a failed CMD24 the card may still be receiving (a partly filled
++ * buffer) or programming. Reset the host CMD/DAT lines, send CMD12 (valid in
++ * the card's rcv state; an illegal command, and so harmless, in tran), and
++ * wait for the card to release DAT0. The log is then stopped for this boot
++ * (sdlog_thread), so no further write is ever issued.
++ */
++static void
++sd_write_abort(void)
++{
++	uint32_t st;
++	sd_reset_lines();
++	uint64_t end = sd_deadline(100000);
++	while ((sd_rd(HC_PRESENT) & PS_CMD_INHIBIT) && mach_absolute_time() < end) {
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	sd_wr(HC_ARG, 0);
++	sd_wr(HC_XFER_CMD, (12u << 8 | CMD_TYPE_ABORT | CMD_IDX_CHECK | CMD_CRC_CHECK | CMD_RESP48_BUSY) << 16);
++	if (sd_wait_int(INT_CMD_DONE, 100000, &st) == 0) {
++		(void)sd_wait_int(INT_XFER_DONE, 1000000, &st);
++	}
++	sd_reset_lines();
++	end = sd_deadline(1000000);
++	while (!(sd_rd(HC_PRESENT) & PS_DAT0) && mach_absolute_time() < end) {
++	}
++	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++}
++
 +/* CMD24 for one 512-byte block, polled PIO; only blocks 1.. of the armed log partition. */
 +static int
 +sd_write_block_hw(uint32_t lba, const uint8_t *buf, uint32_t *stp)
@@ -677,7 +706,7 @@ index 0000000..790eff4
 +	}
 +	if (error) {
 +		*stp = st;
-+		sd_reset_lines();
++		sd_write_abort();
 +		return error;
 +	}
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
@@ -688,12 +717,14 @@ index 0000000..790eff4
 +sd_write_block(uint32_t lba, const uint8_t *buf, bool wait)
 +{
 +	uint32_t st;
-+	boolean_t intr;
-+	if (!sd_claim(&intr, wait)) {
++	if (!sd_claim(wait)) {
 +		return EBUSY;
 +	}
 +	int error = sd_write_block_hw(lba, buf, &st);
-+	sd_release(intr);
++	sd_release();
++	if (error && wait) {
++		printf("LILAC SDLOG: CMD24 lba 0x%x failed %d, int 0x%08x\n", lba, error, st);
++	}
 +	return error;
 +}
 +
@@ -751,7 +782,7 @@ index 0000000..790eff4
 +	for (;;) {
 +		int error = sdlog_flush(sl.buf, 0, 0);
 +		if (error) {
-+			lilac_reset_hook = NULL;
++			lilac_reset_hook = 0;
 +			sl.armed = false;
 +			printf("LILAC SDLOG: write failed (%d), log stopped\n", error);
 +			return;
@@ -1985,7 +2016,7 @@ index b082a10..510b0fd 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..95cb578
+index 0000000..1af50cf
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
 @@ -0,0 +1,220 @@
@@ -2057,10 +2088,10 @@ index 0000000..95cb578
 +	return v;
 +}
 +
-+/* Returns only if PSCI SYSTEM_RESET returns. */
 +/* Run once at the start of a reset delay, inside it (lilac_sd.c SD log flush). */
 +void (*volatile lilac_reset_hook)(uint32_t budget_secs);
 +
++/* Returns only if PSCI SYSTEM_RESET returns. */
 +static void
 +lilac_reset_after(uint64_t secs)
 +{
@@ -2068,8 +2099,8 @@ index 0000000..95cb578
 +	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(freq));
 +	uint64_t end = lilac_counter() + secs * freq;
 +	void (*hook)(uint32_t) = lilac_reset_hook;
-+	if (hook != NULL && secs > 4) {
-+		lilac_reset_hook = NULL;
++	if (hook != 0 && secs > 4) {
++		lilac_reset_hook = 0;
 +		hook((uint32_t)secs - 4);
 +	}
 +	while (lilac_counter() < end) {
