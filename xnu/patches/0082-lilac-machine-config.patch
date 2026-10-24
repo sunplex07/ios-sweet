@@ -58,10 +58,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..31f4bb4
+index 0000000..c9299d3
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,205 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -88,6 +88,8 @@ index 0000000..31f4bb4
 +#include <machine/machine_routines.h>
 +#include <libkern/libkern.h>
 +#include <arm64/sweet_early.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as bsd/dev/sweet_ufs.c */
 +
 +#define SD_MAP_PA       0x0c0a4000ULL   /* MSM core; SDHCI at +0x900 */
 +#define SD_MAP_SIZE     0x1000
