@@ -11,6 +11,39 @@ index f2d8bf8..75ab7cf 100644
  SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 7fd9be1..69ebbb8 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -32,6 +32,10 @@
+ 
+ #include <security/audit/audit.h>
+ 
++#if defined(__arm64__) && defined(LILAC)
++#include <arm64/sweet_early.h>
++#endif
++
+ #if CONFIG_MACF
+ #include <security/mac_framework.h>
+ #endif
+@@ -102,6 +106,17 @@ unix_syscall(
+ 
+ 	code = arm_get_syscall_number(state);
+ 
++#if defined(__arm64__) && defined(LILAC)
++	/* Stage 63: first syscall from PID 1 proves EL0 executed init's code; nibble = code & 15. */
++	{
++		static int lilac_pid1_seen;
++		if (!lilac_pid1_seen && proc_getpid(proc) == 1) {
++			lilac_pid1_seen = 1;
++			lilac_report(63, code & 15u);
++		}
++	}
++#endif
++
+ #define unix_syscall_kprintf(x...)      /* kprintf("unix_syscall: " x) */
+ 
+ 	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
 index 1981490..faecc9b 100644
 --- a/bsd/dev/sweet_spmi.c
