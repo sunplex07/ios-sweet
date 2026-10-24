@@ -58,10 +58,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..0d0def3
+index 0000000..370cd48
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,477 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -394,6 +394,9 @@ index 0000000..0d0def3
 +	case DKIOCISWRITABLE:
 +		*f = 0;
 +		return 0;
++	case DKIOCGETFEATURES:
++		*f = 0;
++		return 0;
 +	case DKIOCSYNCHRONIZE:
 +	case DKIOCSYNCHRONIZECACHE:
 +		return 0;
@@ -683,6 +686,32 @@ index 68612db..d590ddc 100644
  }
  
  static const char * init_programs[] = {
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index b975a24..3110dc7 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -149,6 +149,7 @@
+ 
+ #include <vfs/vfs_disk_conditioner.h>
+ #include <libkern/section_keywords.h>
++#include <sys/disk.h>                    /* LILAC: DKIOCISWRITABLE in vfs_mountroot */
+ 
+ static LCK_GRP_DECLARE(vnode_lck_grp, "vnode");
+ static LCK_ATTR_DECLARE(vnode_lck_attr, 0, 0);
+@@ -1264,7 +1265,12 @@ vfs_mountroot(void)
+ 		 */
+ 		{
+ 			uint32_t rootrw = 0;
+-			if (PE_parse_boot_argn("rootrw", &rootrw, sizeof(rootrw)) && rootrw) {
++			uint32_t writable = 1;
++			/* A device that reports read-only media (LILAC sdroot0) keeps a read-only root. */
++			if (VNOP_IOCTL(rootvp, DKIOCISWRITABLE, (caddr_t)&writable, 0, ctx) != 0) {
++				writable = 1;
++			}
++			if (PE_parse_boot_argn("rootrw", &rootrw, sizeof(rootrw)) && rootrw && writable) {
+ 				mp->mnt_flag &= ~MNT_RDONLY;
+ 			}
+ 		}
 diff --git a/config/MASTER.arm64.lilac b/config/MASTER.arm64.lilac
 new file mode 100644
 index 0000000..65be5f9
