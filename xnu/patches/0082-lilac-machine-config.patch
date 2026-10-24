@@ -58,10 +58,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..c9299d3
+index 0000000..0d0def3
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,474 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -79,12 +79,28 @@ index 0000000..c9299d3
 + *   67: read LBA 0x8000000  past the end of the card: expect nibble 0x0
 + * nibble bit0 = CMD17 completed without error, bit1 = 0x55AA signature,
 + * bit2 = partition 1 type 0x0C (FAT32 LBA), bit3 = partition 1 starts at 2048.
++ *
++ * Step 2: read-only BSD disk sdroot0 / rsdroot0 over one MBR partition of the
++ * card (boot-arg sdpart=N, 1-4, default 2; it must have type 0xAF, Apple HFS),
++ * so rd=sdroot0 roots on it (IOFindBSDRoot, iokit/bsddev/IOKitBSDInit.cpp).
++ * There is no write path: opens for writing and write requests fail with EROFS.
++ * Stage 68 reports the setup: bit0 MBR read, bit1 0x55AA, bit2 partition type
++ * 0xAF with a non-empty extent, bit3 device nodes created.
 + */
 +#if defined(ARM64_BOARD_CONFIG_LILAC)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
 +#include <kern/clock.h>
++#include <pexpert/pexpert.h>
 +#include <machine/machine_routines.h>
 +#include <libkern/libkern.h>
 +#include <arm64/sweet_early.h>
@@ -129,6 +145,14 @@ index 0000000..c9299d3
 +#define SD_BLOCK        512u
 +
 +static vm_offset_t sd_regs;
++
++static void
++sd_map(void)
++{
++	if (!sd_regs) {
++		sd_regs = ml_io_map(SD_MAP_PA, SD_MAP_SIZE);
++	}
++}
 +
 +static inline uint32_t
 +sd_rd(uint32_t off)
@@ -248,7 +272,7 @@ index 0000000..c9299d3
 +		if (!lilac_stop_is(t[i].stage)) {
 +			continue;
 +		}
-+		sd_regs = ml_io_map(SD_MAP_PA, SD_MAP_SIZE);
++		sd_map();
 +		unsigned int nib = 0;
 +		if (sd_read_block(t[i].lba, blk) == 0) {
 +			nib |= 1;
@@ -265,6 +289,251 @@ index 0000000..c9299d3
 +		printf("LILAC SD: probe stage %u lba 0x%x nibble 0x%x\n", t[i].stage, t[i].lba, nib);
 +		lilac_report(t[i].stage, nib);
 +	}
++}
++
++/* ---- step 2: read-only BSD disk over one MBR partition ---- */
++
++static LCK_GRP_DECLARE(lilac_sd_grp, "lilac_sd");
++static LCK_MTX_DECLARE(lilac_sd_lock, &lilac_sd_grp);
++
++static struct {
++	bool     ready;
++	uint32_t first;         /* partition start, card LBA (512-byte blocks) */
++	uint32_t nblocks;       /* partition length in 512-byte blocks */
++	uint32_t secsize;       /* logical sector size presented to BSD */
++	int      bmajor, cmajor;
++	dev_t    bdev;
++	uint8_t  bounce[SD_BLOCK];
++} sdd;
++
++static int
++lilac_sd_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!sdd.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) ? EROFS : 0;
++}
++
++static int
++lilac_sd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++lilac_sd_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * sdd.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = (uint64_t)sdd.nblocks * SD_BLOCK;
++
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
++	}
++	if ((off % SD_BLOCK) || (count % SD_BLOCK) || off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(&lilac_sd_lock);
++	for (uint32_t done = 0; done < count; done += SD_BLOCK) {
++		uint64_t lba = (off + done) / SD_BLOCK;
++		error = sd_read_block(sdd.first + (uint32_t)lba, sdd.bounce);
++		if (error) {
++			break;
++		}
++		memcpy(vaddr + done, sdd.bounce, SD_BLOCK);
++		buf_setresid(bp, count - done - SD_BLOCK);
++	}
++	lck_mtx_unlock(&lilac_sd_lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++lilac_sd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = sdd.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		sdd.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SD_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = (uint64_t)sdd.nblocks * SD_BLOCK / sdd.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 0;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = (128u * 1024u) / sdd.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++lilac_sd_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return lilac_sd_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++lilac_sd_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return lilac_sd_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++lilac_sd_psize(__unused dev_t dev)
++{
++	return sdd.ready ? (int)MIN((uint64_t)sdd.nblocks * SD_BLOCK / sdd.secsize, (uint64_t)INT32_MAX) : -1;
++}
++
++static int
++lilac_sd_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(lilac_sd_strategy, NULL, dev, B_READ, minphys, uio, (int)sdd.secsize);
++}
++
++static int
++lilac_sd_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw lilac_sd_bdevsw = {
++	.d_open     = lilac_sd_open,
++	.d_close    = lilac_sd_close,
++	.d_strategy = lilac_sd_strategy,
++	.d_ioctl    = lilac_sd_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = lilac_sd_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw lilac_sd_cdevsw = {
++	.d_open       = lilac_sd_open,
++	.d_close      = lilac_sd_close,
++	.d_read       = lilac_sd_read,
++	.d_write      = lilac_sd_write,
++	.d_ioctl      = lilac_sd_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++lilac_sd_init(void)
++{
++	unsigned int part = 2, nib = 0;
++	int error;
++
++	PE_parse_boot_argn("sdpart", &part, sizeof(part));
++	if (part < 1 || part > 4) {
++		return EINVAL;
++	}
++	sd_map();
++	lck_mtx_lock(&lilac_sd_lock);
++	error = sd_read_block(0, sdd.bounce);
++	lck_mtx_unlock(&lilac_sd_lock);
++	if (!error) {
++		nib |= 1;
++		const uint8_t *e = sdd.bounce + 446 + 16 * (part - 1);
++		uint32_t first = e[8] | e[9] << 8 | e[10] << 16 | (uint32_t)e[11] << 24;
++		uint32_t n = e[12] | e[13] << 8 | e[14] << 16 | (uint32_t)e[15] << 24;
++		if (sdd.bounce[510] == 0x55 && sdd.bounce[511] == 0xAA) {
++			nib |= 2;
++		}
++		if (e[4] == 0xAF && first != 0 && n != 0 && (uint64_t)first + n <= UINT32_MAX) {
++			nib |= 4;
++			sdd.first = first;
++			sdd.nblocks = n;
++		}
++	}
++	if (nib == 7) {
++		sdd.secsize = SD_BLOCK;
++		sdd.bmajor = bdevsw_add(-1, &lilac_sd_bdevsw);
++		if (sdd.bmajor >= 0) {
++			sdd.cmajor = cdevsw_add_with_bdev(-1, &lilac_sd_cdevsw, sdd.bmajor);
++		}
++		if (sdd.bmajor >= 0 && sdd.cmajor >= 0) {
++			sdd.bdev = makedev(sdd.bmajor, 0);
++			devfs_make_node(sdd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0440, "sdroot0");
++			devfs_make_node(makedev(sdd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0440, "rsdroot0");
++			sdd.ready = true;
++			nib |= 8;
++		}
++	}
++	printf("LILAC SD: partition %u: first 0x%x, %u blocks, setup 0x%x%s\n",
++	    part, sdd.first, sdd.nblocks, nib, sdd.ready ? ", sdroot0 read-only" : "");
++	lilac_report(68, nib);
++	if (!sdd.ready) {
++		return error ? error : ENXIO;
++	}
++	return 0;
++}
++
++/* Root device for rd=sdroot0 (IOFindBSDRoot). */
++int lilac_sd_rootdev(dev_t *dev);
++
++int
++lilac_sd_rootdev(dev_t *dev)
++{
++	if (!sdd.ready) {
++		int error = lilac_sd_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = sdd.bdev;
++	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
@@ -703,7 +972,7 @@ index 92f3e26..e1c676f 100644
      "   },"
      "   {"
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index e6c74aa..840e2b5 100644
+index e6c74aa..e6d2ce3 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
 @@ -43,6 +43,7 @@ extern "C" {
@@ -714,7 +983,31 @@ index e6c74aa..840e2b5 100644
  #include <kern/clock.h>
  #if CONFIG_KDP_INTERACTIVE_DEBUGGING
  #include <kern/debug.h>
-@@ -921,6 +922,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -766,6 +767,23 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_LILAC)
++//
++//	LILAC: read-only root on an MBR partition of the microSD (bsd/dev/lilac_sd.c)
++//
++	if (strcmp(rdBootVar, "sdroot0") == 0) {
++		extern int lilac_sd_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int sd_error = lilac_sd_rootdev(root);
++		if (sd_error) {
++			panic("IOFindBSDRoot: LILAC SD root %s unavailable: %d", rdBootVar, sd_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+@@ -921,6 +939,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  
  #if XNU_TARGET_OS_OSX && defined(__arm64__)
  			// The disk isn't found - have the user pick from System Recovery.
