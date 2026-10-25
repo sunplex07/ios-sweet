@@ -231,10 +231,10 @@ index 0000000..3c3a2dd
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..4404c30
+index 0000000..6b593e3
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,1105 @@
+@@ -0,0 +1,1112 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -1184,10 +1184,17 @@ index 0000000..4404c30
 +	uint32_t lba = sdd.first + sdd.nblocks - 1;
 +	unsigned int nib = 0;
 +
-+	/* The guard alone, without issuing any command. */
-+	if (sdd.writable && sd_lba_writable(sdd.first) && sd_lba_writable(lba) &&
-+	    !sd_lba_writable(0) && !sd_lba_writable(sdd.first - 1) &&
-+	    !sd_lba_writable(sdd.first + sdd.nblocks)) {
++	/*
++	 * The guard alone, without issuing any command. A neighbour block may
++	 * still be writable through the log path when the armed log partition is
++	 * adjacent (on the G20 card p4 ends where p3 starts), so test it against
++	 * that range rather than expect a refusal.
++	 */
++	uint32_t before = sdd.first - 1, after = sdd.first + sdd.nblocks;
++	bool before_log = sl.armed && before > sl.first && before - sl.first < sl.nblocks;
++	bool after_log = sl.armed && after > sl.first && after - sl.first < sl.nblocks;
++	if (sdd.writable && sd_lba_writable(sdd.first) && sd_lba_writable(lba) && !sd_lba_writable(0) &&
++	    sd_lba_writable(before) == before_log && sd_lba_writable(after) == after_log) {
 +		nib |= 1;
 +	}
 +	if (sdd.writable && sd_read_blocks(lba, 1, orig) == 0) {
