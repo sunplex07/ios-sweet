@@ -231,10 +231,10 @@ index 0000000..3c3a2dd
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..595d2d3
+index 0000000..12c3810
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,1139 @@
+@@ -0,0 +1,1244 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -380,19 +380,95 @@ index 0000000..595d2d3
 +#define SD_SPIN_US      20u
 +#define SD_NAP_US       50u
 +
++/*
++ * Data-phase waits (command response, next PIO buffer of a transfer the card is
++ * already streaming) spin up to SD_DATA_SPIN_US before napping: at ~5.8 MB/s a 512-byte block arrives every
++ * ~90 us, and a nap per block (block, idle, timer IRQ, wake) left the single CPU
++ * ~85% idle while HFS reads crawled (G30m2 t+120-420 s, pid 91 in sd_read_blocks).
++ * Card-busy waits (write programming, XFER_DONE) keep the short SD_SPIN_US.
++ */
++#define SD_DATA_SPIN_US 500u
++
++/* Per-report-interval I/O statistics, printed by lilac_sd_report() (lilac_hb.c). */
++#define SDS_PIDS        6u
++static struct {
++	uint32_t rd_req, rd_blk, wr_req, wr_blk;
++	uint64_t rd_abs, wr_abs, max_abs;
++	uint32_t naps;
++	uint64_t nap_abs;
++	struct { int32_t pid; uint32_t blk; char name[17]; } top[SDS_PIDS];
++} sds;
++
 +static void
 +sd_poll_pause(uint64_t spin_end)
 +{
 +	if (mach_absolute_time() > spin_end && !panic_active()) {
++		uint64_t t0 = mach_absolute_time();
 +		delay(SD_NAP_US);
++		os_atomic_inc(&sds.naps, relaxed);
++		os_atomic_add(&sds.nap_abs, mach_absolute_time() - t0, relaxed);
 +	}
 +}
++
++/* One sdroot0 strategy request of nblk blocks that took abs (lilac_sd_lock held). */
++static void
++sd_stat_request(bool rd, uint32_t nblk, uint64_t abs)
++{
++	if (rd) {
++		sds.rd_req++;
++		sds.rd_blk += nblk;
++		sds.rd_abs += abs;
++	} else {
++		sds.wr_req++;
++		sds.wr_blk += nblk;
++		sds.wr_abs += abs;
++	}
++	if (abs > sds.max_abs) {
++		sds.max_abs = abs;
++	}
++	int32_t pid = proc_selfpid();
++	uint32_t slot = SDS_PIDS;
++	for (uint32_t i = 0; i < SDS_PIDS; i++) {
++		if (sds.top[i].blk != 0 && sds.top[i].pid == pid) {
++			slot = i;
++			break;
++		}
++		if (slot == SDS_PIDS && sds.top[i].blk == 0) {
++			slot = i;
++		}
++	}
++	if (slot == SDS_PIDS) {
++		return;
++	}
++	if (sds.top[slot].blk == 0) {
++		sds.top[slot].pid = pid;
++		proc_selfname(sds.top[slot].name, sizeof(sds.top[slot].name));
++	}
++	sds.top[slot].blk += nblk;
++}
++
++static uint32_t
++sd_abs_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++static int sd_wait_int_spin(uint32_t want, uint32_t usec, uint32_t spin_us, uint32_t *status);
 +
 +/* Wait until any bit of want is set in the interrupt status, or an error. */
 +static int
 +sd_wait_int(uint32_t want, uint32_t usec, uint32_t *status)
 +{
-+	uint64_t end = sd_deadline(usec), spin_end = sd_deadline(SD_SPIN_US);
++	return sd_wait_int_spin(want, usec,
++	           (want & (INT_CMD_DONE | INT_BUF_RD | INT_BUF_WR)) ? SD_DATA_SPIN_US : SD_SPIN_US, status);
++}
++
++static int
++sd_wait_int_spin(uint32_t want, uint32_t usec, uint32_t spin_us, uint32_t *status)
++{
++	uint64_t end = sd_deadline(usec), spin_end = sd_deadline(spin_us);
 +	for (;;) {
 +		uint32_t s = sd_rd(HC_INT_STATUS);
 +		if (s & (INT_ERROR | INT_ERR_MASK)) {
@@ -790,6 +866,7 @@ index 0000000..595d2d3
 +		error = EIO;
 +		goto done;
 +	}
++	uint64_t t_req = mach_absolute_time();
 +	lck_mtx_lock(&lilac_sd_lock);
 +	for (uint32_t done = 0; done < count;) {
 +		uint32_t k = MIN((count - done) / SD_BLOCK, SD_MULTI_MAX);
@@ -809,6 +886,7 @@ index 0000000..595d2d3
 +		done += k * SD_BLOCK;
 +		buf_setresid(bp, count - done);
 +	}
++	sd_stat_request(rd, count / SD_BLOCK, mach_absolute_time() - t_req);
 +	lck_mtx_unlock(&lilac_sd_lock);
 +	buf_unmap(bp);
 +done:
@@ -816,6 +894,33 @@ index 0000000..595d2d3
 +		buf_seterror(bp, error);
 +	}
 +	buf_biodone(bp);
++}
++
++void lilac_sd_report(void);
++
++/* Called every LILAC PROF report (lilac_hb.c) from the heartbeat thread. */
++void
++lilac_sd_report(void)
++{
++	if (!sdd.nblocks) {
++		return;
++	}
++	lck_mtx_lock(&lilac_sd_lock);
++	__typeof__(sds) s = sds;
++	bzero(&sds.rd_req, offsetof(__typeof__(sds), naps));
++	bzero(&sds.top, sizeof(sds.top));
++	lck_mtx_unlock(&lilac_sd_lock);
++	uint32_t naps = os_atomic_xchg(&sds.naps, 0u, relaxed);
++	uint64_t nap_abs = os_atomic_xchg(&sds.nap_abs, 0ull, relaxed);
++
++	printf("LILAC SDSTAT rd %u req %u KiB %u ms | wr %u req %u KiB %u ms | max %u ms | naps %u %u ms\n",
++	    s.rd_req, s.rd_blk / 2, sd_abs_ms(s.rd_abs), s.wr_req, s.wr_blk / 2, sd_abs_ms(s.wr_abs),
++	    sd_abs_ms(s.max_abs), naps, sd_abs_ms(nap_abs));
++	for (uint32_t i = 0; i < SDS_PIDS; i++) {
++		if (s.top[i].blk != 0) {
++			printf("LILAC SDSTAT  pid %d %s %u KiB\n", s.top[i].pid, s.top[i].name, s.top[i].blk / 2);
++		}
++	}
 +}
 +
 +static int
@@ -3259,10 +3364,10 @@ index 0000000..557b23e
 +#endif /* LILAC */
 diff --git a/osfmk/arm64/lilac_hb.c b/osfmk/arm64/lilac_hb.c
 new file mode 100644
-index 0000000..ea8b06c
+index 0000000..4bb812b
 --- /dev/null
 +++ b/osfmk/arm64/lilac_hb.c
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,149 @@
 +/*
 + * LILAC: watchdog heartbeat and timer-interrupt PC sampler.
 + *
@@ -3379,6 +3484,8 @@ index 0000000..ea8b06c
 +		    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].lr));
 +		snap[best].n = 0;
 +	}
++	extern void lilac_sd_report(void);
++	lilac_sd_report();      /* bsd/dev/lilac_sd.c: SD requests, KiB, time, naps for the same interval */
 +}
 +
 +static void
@@ -3704,6 +3811,436 @@ index b0dad49..0401dd6 100644
  osfmk/arm64/arm64_hypercall.c	standard
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 384118e..0e55064 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -102,6 +102,9 @@
+ 
+ #include <pexpert/pexpert.h>
+ #include <sys/kdebug.h>
++#if defined(ARM64_BOARD_CONFIG_LILAC)
++#include <pexpert/arm64/board_config.h>         /* defines LILAC */
++#endif
+ 
+ #include "iso_font.c"
+ #if defined(XNU_TARGET_OS_OSX)
+@@ -1324,6 +1327,273 @@ static boolean_t vc_progress_white =
+ 
+ static int vc_acquire_delay = kProgressAcquireDelay;
+ 
++#if defined(LILAC)
++/*
++ * LILAC: 24 bpp text console on the MSM8998 continuous-splash RAM
++ * (0x9D400000, 720x1280, stride 2160, bytes B,G,R per pixel, i.e. 0xRRGGBB
++ * stored little-endian in 3 bytes). Off unless boot-arg lilacfb=1; without
++ * it every path below falls through to the unchanged code, which draws
++ * nothing at 24 bpp.
++ *
++ * The framebuffer is mapped as Device memory: no HAS_UCNORMAL_MEM, so
++ * initialize_screen() asks for VM_WIMG_IO, and the mapping is made before
++ * kmem is up, so io_map() uses pmap_map_bd() -> CACHE_ATTRINDX_DISABLE
++ * (MAIR 0x00, Device-nGnRnE). Unaligned accesses and DC ZVA take alignment
++ * faults there, so every framebuffer access in this block is a volatile,
++ * naturally aligned 64-bit access, or a byte access when the address is not
++ * 8-byte aligned. No bcopy/bzero/memset is applied to the framebuffer.
++ */
++static boolean_t vc_lilacfb = FALSE;            /* lilacfb=1; parsed once in initialize_screen() */
++static boolean_t vc_lilacfb_parsed = FALSE;
++static uint64_t  vc24_fore[3];                  /* 8 foreground pixels, as stored in memory */
++static uint64_t  vc24_back[3];                  /* 8 background pixels, as stored in memory */
++
++#define VC_LILAC24()    (vc_lilacfb && (vinfo.v_depth == 24))
++
++/* 8 pixels of colour 0xRRGGBB: byte k is component k % 3 (B, G, R) of pixel k / 3 */
++static void
++vc24_pattern(uint32_t rgb, uint64_t pat[3])
++{
++	unsigned int k;
++
++	pat[0] = pat[1] = pat[2] = 0;
++	for (k = 0; k < 24; k++) {
++		uint64_t byte = (rgb >> (8 * (k % 3))) & 0xFF;
++		pat[k / 8] |= byte << (8 * (k % 8));
++	}
++}
++
++/* 0xFF in the 3 bytes of every pixel whose font bit is set (bit 0 = leftmost) */
++static void
++vc24_expand(unsigned int bits, uint64_t m[3])
++{
++	unsigned int k;
++
++	m[0] = m[1] = m[2] = 0;
++	for (k = 0; k < 24; k++) {
++		if (bits & (1u << (k / 3))) {
++			m[k / 8] |= 0xFFULL << (8 * (k % 8));
++		}
++	}
++}
++
++/* Store 8 pixels (24 bytes) at a framebuffer address. */
++static void
++vc24_store8(uintptr_t addr, const uint64_t w[3])
++{
++	unsigned int k;
++
++	if ((addr & 7) == 0) {
++		volatile uint64_t *d = (volatile uint64_t *)addr;
++		d[0] = w[0];
++		d[1] = w[1];
++		d[2] = w[2];
++	} else {
++		volatile uint8_t *d = (volatile uint8_t *)addr;
++		for (k = 0; k < 24; k++) {
++			d[k] = (uint8_t)(w[k / 8] >> (8 * (k % 8)));
++		}
++	}
++}
++
++/* Fill scanlines [first, last) with the background colour. */
++static void
++vc24_fill_lines(uint32_t first, uint32_t last)
++{
++	uint32_t line, x, k;
++	uint32_t groups = vinfo.v_width / 8;
++	uint32_t tail = (vinfo.v_width % 8) * 3;
++
++	if (last > vinfo.v_height) {
++		last = vinfo.v_height;
++	}
++	for (line = first; line < last; line++) {
++		uintptr_t row = vinfo.v_baseaddr + (uintptr_t)line * vinfo.v_rowbytes;
++		for (x = 0; x < groups; x++) {
++			vc24_store8(row + (uintptr_t)x * 24, vc24_back);
++		}
++		if (tail) {
++			volatile uint8_t *d = (volatile uint8_t *)(row + (uintptr_t)groups * 24);
++			for (k = 0; k < tail; k++) {
++				d[k] = (uint8_t)(vc24_back[k / 8] >> (8 * (k % 8)));
++			}
++		}
++	}
++}
++
++/* Copy the displayed part of scanline src_line to dst_line. */
++static void
++vc24_copy_line(uint32_t dst_line, uint32_t src_line)
++{
++	uintptr_t d, s;
++	uint32_t n = vinfo.v_rowscanbytes, k;
++
++	if (dst_line >= vinfo.v_height || src_line >= vinfo.v_height) {
++		return;
++	}
++	d = vinfo.v_baseaddr + (uintptr_t)dst_line * vinfo.v_rowbytes;
++	s = vinfo.v_baseaddr + (uintptr_t)src_line * vinfo.v_rowbytes;
++	if (((d | s | n) & 7) == 0) {
++		volatile uint64_t *dp = (volatile uint64_t *)d;
++		volatile uint64_t *sp = (volatile uint64_t *)s;
++		for (k = 0; k < n / 8; k++) {
++			dp[k] = sp[k];
++		}
++	} else {
++		volatile uint8_t *dp = (volatile uint8_t *)d;
++		volatile uint8_t *sp = (volatile uint8_t *)s;
++		for (k = 0; k < n; k++) {
++			dp[k] = sp[k];
++		}
++	}
++}
++
++static void
++vc_clear_screen_24(unsigned int xx, unsigned int yy, unsigned int scrreg_top,
++    unsigned int scrreg_bottom, int which)
++{
++	switch (which) {
++	case 0:         /* To end of screen	 */
++		gc_clear_line(xx, yy, 0);
++		if (yy < scrreg_bottom - 1) {
++			vc24_fill_lines((yy + 1) * ISO_CHAR_HEIGHT, scrreg_bottom * ISO_CHAR_HEIGHT);
++		}
++		break;
++	case 1:         /* To start of screen	 */
++		gc_clear_line(xx, yy, 1);
++		if (yy > scrreg_top) {
++			vc24_fill_lines(scrreg_top * ISO_CHAR_HEIGHT, yy * ISO_CHAR_HEIGHT);
++		}
++		break;
++	case 2:         /* Whole screen		 */
++		vc24_fill_lines(scrreg_top * ISO_CHAR_HEIGHT,
++		    (scrreg_bottom == vinfo.v_rows) ? vinfo.v_height : scrreg_bottom * ISO_CHAR_HEIGHT);
++		break;
++	}
++}
++
++static void
++vc_paint_char_24(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
++    unsigned char ch_previous, int attrs_previous)
++{
++	const unsigned char *bitsp = iso_font + (ch * ISO_CHAR_HEIGHT);
++	const unsigned char *prevp = NULL;
++	uintptr_t where;
++	int i, w;
++
++	/*
++	 * As in vc_paint_char_32: gc_scroll_up/down pass ch_previous only when
++	 * the cell already shows it in the same colours, so glyph rows that
++	 * are identical need no framebuffer write.
++	 */
++	if (ch_previous && !attrs_previous && !attrs) {
++		prevp = iso_font + (ch_previous * ISO_CHAR_HEIGHT);
++	}
++
++	if (xx >= vinfo.v_columns || yy >= vinfo.v_rows) {
++		return;
++	}
++	where = vinfo.v_baseaddr + ((uintptr_t)yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
++	    ((uintptr_t)xx * ISO_CHAR_WIDTH * 3);
++
++	for (i = 0; i < ISO_CHAR_HEIGHT; i++) {
++		uint64_t m[3], out[3];
++		const uint64_t *r = NULL;
++
++		if (prevp && prevp[i] == bitsp[i]) {
++			where += vinfo.v_rowbytes;
++			continue;
++		}
++		if (!attrs && vc_rendered_font &&
++		    vc_rendered_char_size == ISO_CHAR_HEIGHT * 3 * ISO_CHAR_WIDTH) {
++			r = (const uint64_t *)(vc_rendered_font + (ch * vc_rendered_char_size) + (i * 24));
++			if (((uintptr_t)r & 7) != 0) {
++				r = NULL;
++			}
++		}
++		if (r) {
++			m[0] = r[0];
++			m[1] = r[1];
++			m[2] = r[2];
++		} else {
++			unsigned int bits = bitsp[i];
++			if (attrs & ATTR_BOLD) {        /* a pixel is also set if its left neighbour is */
++				bits |= (bits << 1) & 0xFF;
++			}
++			if (attrs & ATTR_REVERSE) {
++				bits = ~bits & 0xFF;
++			}
++			if ((attrs & ATTR_UNDER) && i == ISO_CHAR_HEIGHT - 1) {
++				bits = ~bits & 0xFF;
++			}
++			vc24_expand(bits, m);
++		}
++		for (w = 0; w < 3; w++) {
++			out[w] = (vc24_back[w] & ~m[w]) | (vc24_fore[w] & m[w]);
++		}
++		vc24_store8(where, out);
++		where += vinfo.v_rowbytes;
++	}
++}
++
++static void
++vc_reverse_cursor_24(unsigned int xx, unsigned int yy)
++{
++	uintptr_t where;
++	int line, k;
++
++	if (xx >= vinfo.v_columns || yy >= vinfo.v_rows) {
++		return;
++	}
++	where = vinfo.v_baseaddr + ((uintptr_t)yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
++	    ((uintptr_t)xx * ISO_CHAR_WIDTH * 3);
++	for (line = 0; line < ISO_CHAR_HEIGHT; line++) {
++		if ((where & 7) == 0) {
++			volatile uint64_t *d = (volatile uint64_t *)where;
++			d[0] = ~d[0];
++			d[1] = ~d[1];
++			d[2] = ~d[2];
++		} else {
++			volatile uint8_t *d = (volatile uint8_t *)where;
++			for (k = 0; k < 24; k++) {
++				d[k] = (uint8_t)~d[k];
++			}
++		}
++		where += vinfo.v_rowbytes;
++	}
++}
++
++static void
++vc_scroll_up_24(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
++{
++	uint32_t line, shift;
++
++	if (num <= 0 || scrreg_bottom > vinfo.v_rows || scrreg_top >= scrreg_bottom ||
++	    (unsigned int)num >= scrreg_bottom - scrreg_top) {
++		return;
++	}
++	shift = (uint32_t)num * ISO_CHAR_HEIGHT;
++	for (line = scrreg_top * ISO_CHAR_HEIGHT; line < (scrreg_bottom - (unsigned int)num) * ISO_CHAR_HEIGHT; line++) {
++		vc24_copy_line(line, line + shift);
++	}
++}
++
++static void
++vc_scroll_down_24(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
++{
++	uint32_t line, shift;
++
++	if (num <= 0 || scrreg_bottom > vinfo.v_rows || scrreg_top >= scrreg_bottom ||
++	    (unsigned int)num >= scrreg_bottom - scrreg_top) {
++		return;
++	}
++	shift = (uint32_t)num * ISO_CHAR_HEIGHT;
++	for (line = scrreg_bottom * ISO_CHAR_HEIGHT; line-- > (scrreg_top + (unsigned int)num) * ISO_CHAR_HEIGHT;) {
++		vc24_copy_line(line, line - shift);
++	}
++}
++#endif /* LILAC */
++
+ static void
+ vc_clear_screen(unsigned int xx, unsigned int yy, unsigned int scrreg_top,
+     unsigned int scrreg_bottom, int which)
+@@ -1335,6 +1605,12 @@ vc_clear_screen(unsigned int xx, unsigned int yy, unsigned int scrreg_top,
+ 	if (!vinfo.v_depth) {
+ 		return;
+ 	}
++#if defined(LILAC)
++	if (VC_LILAC24()) {
++		vc_clear_screen_24(xx, yy, scrreg_top, scrreg_bottom, which);
++		return;
++	}
++#endif
+ 
+ 	linelongs = vinfo.v_rowbytes * (ISO_CHAR_HEIGHT >> 2);
+ 	rowline = vinfo.v_rowscanbytes >> 2;
+@@ -1404,6 +1680,16 @@ vc_render_char(unsigned char ch, unsigned char *renderptr, short newdepth)
+ 			case 32:
+ 				*current.longptr++ = (*theChar & mask) ? 0xFFFFFFFF : 0;
+ 				break;
++#if defined(LILAC)
++			case 24:
++				if (vc_lilacfb) {       /* 3 bytes per pixel, 24 per glyph row */
++					unsigned char px = (*theChar & mask) ? 0xFF : 0;
++					*current.charptr++ = px;
++					*current.charptr++ = px;
++					*current.charptr++ = px;
++				}
++				break;
++#endif
+ 			}
+ 			mask <<= 1;
+ 		} while (mask); /* while the single bit drops to the right */
+@@ -1618,6 +1904,12 @@ vc_paint_char(unsigned int xx, unsigned int yy, unsigned char ch, int attrs,
+ 	if (!vinfo.v_depth) {
+ 		return;
+ 	}
++#if defined(LILAC)
++	if (VC_LILAC24()) {
++		vc_paint_char_24(xx, yy, ch, attrs, ch_previous, attrs_previous);
++		return;
++	}
++#endif
+ 
+ 	switch (vinfo.v_depth) {
+ 	case 8:
+@@ -1706,6 +1998,12 @@ vc_reverse_cursor(unsigned int xx, unsigned int yy)
+ 	if (!vinfo.v_depth) {
+ 		return;
+ 	}
++#if defined(LILAC)
++	if (VC_LILAC24()) {
++		vc_reverse_cursor_24(xx, yy);
++		return;
++	}
++#endif
+ 
+ 	where = (uint32_t*)(vinfo.v_baseaddr +
+ 	    (yy * ISO_CHAR_HEIGHT * vinfo.v_rowbytes) +
+@@ -1739,6 +2037,12 @@ vc_scroll_down(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
+ 	if (!vinfo.v_depth) {
+ 		return;
+ 	}
++#if defined(LILAC)
++	if (VC_LILAC24()) {
++		vc_scroll_down_24(num, scrreg_top, scrreg_bottom);
++		return;
++	}
++#endif
+ 
+ 	linelongs = vinfo.v_rowbytes * (ISO_CHAR_HEIGHT >> 2);
+ 	rowline = vinfo.v_rowbytes >> 2;
+@@ -1773,6 +2077,12 @@ vc_scroll_up(int num, unsigned int scrreg_top, unsigned int scrreg_bottom)
+ 	if (!vinfo.v_depth) {
+ 		return;
+ 	}
++#if defined(LILAC)
++	if (VC_LILAC24()) {
++		vc_scroll_up_24(num, scrreg_top, scrreg_bottom);
++		return;
++	}
++#endif
+ 
+ 	linelongs = vinfo.v_rowbytes * (ISO_CHAR_HEIGHT >> 2);
+ 	rowline = vinfo.v_rowbytes >> 2;
+@@ -1809,6 +2119,12 @@ vc_update_color(int color, boolean_t fore)
+ 	} else {
+ 		vc_color_back = vc_colors[color][vc_color_index_table[vinfo.v_depth]];
+ 	}
++#if defined(LILAC)
++	if (VC_LILAC24()) {
++		/* the 32 bpp column holds 0x00RRGGBB */
++		vc24_pattern(vc_colors[color][vc_color_index_table[32]], fore ? vc24_fore : vc24_back);
++	}
++#endif
+ }
+ 
+ /*
+@@ -1920,6 +2236,11 @@ vc_blit_rect(int x, int y, int bx,
+ 	if (((unsigned int)(y + height)) > vinfo.v_height) {
+ 		return;
+ 	}
++#if defined(LILAC)
++	if (vinfo.v_depth == 24) {
++		return;         /* no 24 bpp blitter: icons/progress are not drawn */
++	}
++#endif
+ 
+ 	switch (vinfo.v_depth) {
+ 	case 8:
+@@ -2796,6 +3117,17 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 	boolean_t graphics_now;
+ 	uint32_t delay;
+ 
++#if defined(LILAC)
++	if (!vc_lilacfb_parsed) {
++		/* First call is PE_create_console() from arm_init(): boot-args are available. */
++		uint32_t lilacfb = 0;
++		vc_lilacfb_parsed = TRUE;
++		if (PE_parse_boot_argn("lilacfb", &lilacfb, sizeof(lilacfb)) && lilacfb == 1) {
++			vc_lilacfb = TRUE;
++		}
++	}
++#endif
++
+ 	if (boot_vinfo) {
+ 		struct vc_info new_vinfo = vinfo;
+ 		boolean_t makeMapping = FALSE;
+@@ -2925,6 +3257,16 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 		}
+ 	}
+ 
++#if defined(LILAC)
++	/*
++	 * The loader passes v_display=1, so PE_create_console() asks for
++	 * kPEGraphicsMode and the text console would stay disabled (nothing on
++	 * arm turns "-v" into kPETextScreen). lilacfb=1 asks for the text console.
++	 */
++	if (op == kPEGraphicsMode && VC_LILAC24()) {
++		op = kPETextMode;
++	}
++#endif
+ 	graphics_now = gc_graphics_boot && !gc_desire_text;
+ 	switch (op) {
+ 	case kPEGraphicsMode:
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
 index 437adb1..cfddf19 100644
 --- a/osfmk/kern/debug.c
