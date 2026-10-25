@@ -231,10 +231,10 @@ index 0000000..3c3a2dd
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..6b593e3
+index 0000000..595d2d3
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,1112 @@
+@@ -0,0 +1,1139 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -280,6 +280,7 @@ index 0000000..6b593e3
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/locks.h>
 +#include <kern/clock.h>
++#include <kern/debug.h>
 +#include <pexpert/pexpert.h>
 +#include <machine/machine_routines.h>
 +#include <libkern/libkern.h>
@@ -364,11 +365,34 @@ index 0000000..6b593e3
 +	return mach_absolute_time() + abs;
 +}
 +
++/*
++ * Polling without holding the CPU. The controller is driven without
++ * interrupts, and a card programming a CMD24 block or fetching a CMD17/18
++ * block keeps the caller waiting for hundreds of microseconds to
++ * milliseconds; spinning through that charged the whole wait to the caller
++ * and starved everything else on the single CPU (G29-HB: logd_helper spent
++ * ~90 s of system time in sd_write_block_hw's XFER_DONE wait). After
++ * SD_SPIN_US of polling, a caller that may block sleeps SD_NAP_US between
++ * polls: delay() blocks the thread when interrupts and preemption are
++ * enabled and spins otherwise, so the reset-time log flush (interrupts may be
++ * masked) and panic keep polling.
++ */
++#define SD_SPIN_US      20u
++#define SD_NAP_US       50u
++
++static void
++sd_poll_pause(uint64_t spin_end)
++{
++	if (mach_absolute_time() > spin_end && !panic_active()) {
++		delay(SD_NAP_US);
++	}
++}
++
 +/* Wait until any bit of want is set in the interrupt status, or an error. */
 +static int
 +sd_wait_int(uint32_t want, uint32_t usec, uint32_t *status)
 +{
-+	uint64_t end = sd_deadline(usec);
++	uint64_t end = sd_deadline(usec), spin_end = sd_deadline(SD_SPIN_US);
 +	for (;;) {
 +		uint32_t s = sd_rd(HC_INT_STATUS);
 +		if (s & (INT_ERROR | INT_ERR_MASK)) {
@@ -383,7 +407,22 @@ index 0000000..6b593e3
 +			*status = s;
 +			return ETIMEDOUT;
 +		}
++		sd_poll_pause(spin_end);
 +	}
++}
++
++/* Wait until none of the HC_PRESENT bits in mask is set. */
++static int
++sd_wait_present_clear(uint32_t mask, uint32_t usec)
++{
++	uint64_t end = sd_deadline(usec), spin_end = sd_deadline(SD_SPIN_US);
++	while (sd_rd(HC_PRESENT) & mask) {
++		if (mach_absolute_time() > end) {
++			return EBUSY;
++		}
++		sd_poll_pause(spin_end);
++	}
++	return 0;
 +}
 +
 +/* Software reset of the CMD and DAT state machines after an error (card state untouched). */
@@ -404,11 +443,8 @@ index 0000000..6b593e3
 +{
 +	uint32_t st = 0;
 +	*stp = 0;
-+	uint64_t end = sd_deadline(100000);
-+	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
-+		if (mach_absolute_time() > end) {
-+			return EBUSY;
-+		}
++	if (sd_wait_present_clear(PS_CMD_INHIBIT | PS_DAT_INHIBIT, 100000)) {
++		return EBUSY;
 +	}
 +	if ((sd_rd(HC_INT_ENABLE) & (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) != (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) {
 +		sd_wr(HC_INT_ENABLE, INT_ENABLE_UEFI);
@@ -455,11 +491,8 @@ index 0000000..6b593e3
 +static int
 +sd_stop_transmission(uint32_t *stp)
 +{
-+	uint64_t end = sd_deadline(100000);
-+	while (sd_rd(HC_PRESENT) & PS_CMD_INHIBIT) {
-+		if (mach_absolute_time() > end) {
-+			return EBUSY;
-+		}
++	if (sd_wait_present_clear(PS_CMD_INHIBIT, 100000)) {
++		return EBUSY;
 +	}
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
 +	sd_wr(HC_ARG, 0);
@@ -484,11 +517,8 @@ index 0000000..6b593e3
 +	if (n < 2 || n > SD_MULTI_MAX) {
 +		return EINVAL;
 +	}
-+	uint64_t end = sd_deadline(100000);
-+	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
-+		if (mach_absolute_time() > end) {
-+			return EBUSY;
-+		}
++	if (sd_wait_present_clear(PS_CMD_INHIBIT | PS_DAT_INHIBIT, 100000)) {
++		return EBUSY;
 +	}
 +	if ((sd_rd(HC_INT_ENABLE) & (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) != (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_RD)) {
 +		sd_wr(HC_INT_ENABLE, INT_ENABLE_UEFI);
@@ -1095,11 +1125,8 @@ index 0000000..6b593e3
 +	if (!(sd_rd(HC_PRESENT) & PS_WRITABLE)) {
 +		return EROFS;
 +	}
-+	uint64_t end = sd_deadline(100000);
-+	while (sd_rd(HC_PRESENT) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT)) {
-+		if (mach_absolute_time() > end) {
-+			return EBUSY;
-+		}
++	if (sd_wait_present_clear(PS_CMD_INHIBIT | PS_DAT_INHIBIT, 100000)) {
++		return EBUSY;
 +	}
 +	if ((sd_rd(HC_INT_ENABLE) & (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_WR)) != (INT_CMD_DONE | INT_XFER_DONE | INT_BUF_WR)) {
 +		sd_wr(HC_INT_ENABLE, INT_ENABLE_UEFI);
@@ -2189,6 +2216,357 @@ index 2545cf9..232911c 100644
  	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
  	    topology->num_cpus, topology->num_cpus);
  	thread_terminate(current_thread());
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..7f40865 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -116,6 +116,25 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++#if defined(LILAC)
++	/*
++	 * 24 bpp panel (LILAC): the default surface is a BGRA buffer of the
++	 * logical size; frames are scaled (nearest neighbour, uniform,
++	 * letterboxed) into a cached shadow of the panel memory, whose changed
++	 * rows are then stored into the panel with aligned stores.
++	 */
++	uint32_t      fBpp;           /* panel bytes per pixel: 3, or 4 (SWEET path) */
++	uint32_t      fScaleW, fScaleH, fScaleX, fScaleY;   /* scaled frame on the panel */
++	uint16_t     *fColSrc;        /* logical x sampled by each scaled column */
++	uint16_t     *fRowSrc;        /* logical y sampled by each scaled row */
++	uint8_t      *fShadow;        /* fRowBytes * fHeight, panel layout */
++	uint32_t      fShadowSize;
++
++	bool lilacSetup(void);
++	void lilacPresent(const uint8_t *rec);
++	void lilacFlush(uint32_t y0, uint32_t y1, uint32_t b0, uint32_t b1);
++	void lilacFade(uint32_t step);
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -162,7 +181,12 @@ AppleCLCD::start(IOService *provider)
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
++#if defined(LILAC)
++	fBpp = video.v_depth == 24 ? 3 : 4;
++	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * fBpp) {
++#else
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
++#endif
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+@@ -178,8 +202,19 @@ AppleCLCD::start(IOService *provider)
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
++#if defined(LILAC)
++	if (fBpp == 3) {
++		if (!lilacSetup()) {
++			fPixels = 0;
++		}
++	} else {
++		fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++		fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	}
++#else
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++#endif
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -201,6 +236,13 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++#if defined(LILAC)
++	if (fBpp == 3) {
++		IOLog("SWEET FB: LILAC 24bpp panel %ux%u stride %u, BGRA default surface %u %ux%u, scaled to %ux%u at x %u\n",
++		    fWidth, fHeight, fRowBytes, fSurface->id, fSurface->width, fSurface->height,
++		    fScaleW, fScaleH, fScaleX);
++	}
++#endif
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -231,6 +273,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++#if defined(LILAC)
++		if (fb->fBpp == 3) {
++			if (step <= 6) {
++				fb->lilacFade(step);    /* 24 bpp rows: no unaligned 32-bit access */
++			}
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
++		}
++#endif
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -323,6 +374,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++#if defined(LILAC)
++	if (fBpp == 3) {
++		lilacPresent(rec);
++		return;
++	}
++#endif
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -401,6 +458,244 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ }
+ 
++#if defined(LILAC)
++/*
++ * LILAC (24 bpp panel, B,G,R bytes per pixel at fPhys).
++ *
++ * The panel is mapped write-combined (Normal, non-cacheable: MAIR 0x44),
++ * like the SWEET panel surface. Only fShadow (cached kernel memory with the
++ * panel's layout) is composed into, with byte stores; lilacFlush() then
++ * copies the changed part of each row into the panel with naturally aligned
++ * 32-bit volatile stores (rows are 4-byte aligned: stride 2160), so no
++ * unaligned access, DC ZVA or library memcpy ever touches the panel and the
++ * panel is never read.
++ */
++bool
++AppleCLCD::lilacSetup(void)
++{
++	uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
++
++	if (panelBytes > (256u << 20) || fLogicalW > 0xffff || fLogicalH > 0xffff) {
++		return false;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++	    (IOByteCount)panelBytes, kIODirectionInOut);
++	if (md != NULL) {
++		fMap = md->map(kIOMapWriteCombineCache);
++		md->release();          /* the map holds it */
++	}
++	fPixels = fMap != NULL ? fMap->getVirtualAddress() : 0;
++
++	/* Uniform scale of the logical frame to fit the panel, centred. */
++	if ((uint64_t)fLogicalW * fHeight >= (uint64_t)fLogicalH * fWidth) {
++		fScaleW = fWidth;
++		fScaleH = (uint32_t)(((uint64_t)fLogicalH * fWidth + fLogicalW / 2) / fLogicalW);
++	} else {
++		fScaleH = fHeight;
++		fScaleW = (uint32_t)(((uint64_t)fLogicalW * fHeight + fLogicalH / 2) / fLogicalH);
++	}
++	fScaleW = fScaleW == 0 ? 1 : (fScaleW > fWidth ? fWidth : fScaleW);
++	fScaleH = fScaleH == 0 ? 1 : (fScaleH > fHeight ? fHeight : fScaleH);
++	fScaleX = (fWidth - fScaleW) / 2;
++	fScaleY = (fHeight - fScaleH) / 2;
++
++	fShadowSize = (uint32_t)panelBytes;
++	fShadow = (uint8_t *)IOMallocZeroData(fShadowSize);
++	fColSrc = (uint16_t *)IOMallocData(fScaleW * sizeof(uint16_t));
++	fRowSrc = (uint16_t *)IOMallocData(fScaleH * sizeof(uint16_t));
++	if (fPixels == 0 || fShadow == NULL || fColSrc == NULL || fRowSrc == NULL) {
++		return false;
++	}
++	/* Nearest neighbour: sample the logical pixel under each scaled pixel's centre. */
++	for (uint32_t i = 0; i < fScaleW; i++) {
++		fColSrc[i] = (uint16_t)(((2 * (uint64_t)i + 1) * fLogicalW) / (2 * (uint64_t)fScaleW));
++	}
++	for (uint32_t j = 0; j < fScaleH; j++) {
++		fRowSrc[j] = (uint16_t)(((2 * (uint64_t)j + 1) * fLogicalH) / (2 * (uint64_t)fScaleH));
++	}
++
++	/* The default surface handed to userland: BGRA, logical size, 64-byte rows. */
++	fSurface = sweet_surface_create_buffer(fLogicalW, fLogicalH, (fLogicalW * 4 + 63) & ~63u,
++	    SWEET_FB_FORMAT_BGRA);
++	if (fSurface == NULL) {
++		return false;
++	}
++
++	/* Black bars around the scaled frame (the shadow is zeroed). */
++	lilacFlush(0, fHeight, 0, fScaleX * 3);
++	lilacFlush(0, fHeight, (fScaleX + fScaleW) * 3, fWidth * 3);
++	lilacFlush(0, fScaleY, 0, fWidth * 3);
++	lilacFlush(fScaleY + fScaleH, fHeight, 0, fWidth * 3);
++	return true;
++}
++
++/* Copy shadow rows [y0, y1), bytes [b0, b1) of each, into the panel. */
++void
++AppleCLCD::lilacFlush(uint32_t y0, uint32_t y1, uint32_t b0, uint32_t b1)
++{
++	if (y1 > fHeight) {
++		y1 = fHeight;
++	}
++	if (b1 > fRowBytes) {
++		b1 = fRowBytes;
++	}
++	if (y0 >= y1 || b0 >= b1) {
++		return;
++	}
++	if (((fPixels | fRowBytes | (uintptr_t)fShadow) & 3) == 0) {
++		b0 &= ~3u;
++		b1 = (b1 + 3) & ~3u;            /* <= fRowBytes, a multiple of 4 */
++		uint32_t words = (b1 - b0) / 4;
++		for (uint32_t y = y0; y < y1; y++) {
++			uint64_t off = (uint64_t)y * fRowBytes + b0;
++			const uint32_t *s = (const uint32_t *)((uintptr_t)fShadow + off);
++			volatile uint32_t *d = (volatile uint32_t *)(fPixels + off);
++			for (uint32_t k = 0; k < words; k++) {
++				d[k] = s[k];
++			}
++		}
++	} else {
++		for (uint32_t y = y0; y < y1; y++) {
++			uint64_t off = (uint64_t)y * fRowBytes;
++			volatile uint8_t *d = (volatile uint8_t *)(fPixels + off);
++			for (uint32_t k = b0; k < b1; k++) {
++				d[k] = fShadow[off + k];
++			}
++		}
++	}
++}
++
++/* Fade step while off: halve every byte of the shadow (6 steps), then black. */
++void
++AppleCLCD::lilacFade(uint32_t step)
++{
++	uint32_t *w = (uint32_t *)(uintptr_t)fShadow;    /* page-aligned kmem allocation */
++	uint32_t words = fShadowSize / 4;
++
++	for (uint32_t i = 0; i < words; i++) {
++		w[i] = step < 6 ? (w[i] >> 1) & 0x7f7f7f7f : 0;
++	}
++	for (uint32_t i = words * 4; i < fShadowSize; i++) {
++		fShadow[i] = (uint8_t)(step < 6 ? fShadow[i] >> 1 : 0);
++	}
++	lilacFlush(0, fHeight, 0, fRowBytes);
++}
++
++/* First index of the non-decreasing table t[0..n) with t[i] >= v (n if none). */
++static uint32_t
++lilac_lower_bound(const uint16_t *t, uint32_t n, uint32_t v)
++{
++	uint32_t lo = 0, hi = n;
++	while (lo < hi) {
++		uint32_t mid = (lo + hi) / 2;
++		if (t[mid] < v) {
++			lo = mid + 1;
++		} else {
++			hi = mid;
++		}
++	}
++	return lo;
++}
++
++/*
++ * Compose the enabled layers (clipped in logical coordinates, the default
++ * surface included) into the shadow, scaled; then flush the changed part.
++ * A scaled pixel belongs to a layer when its logical sample point lies in
++ * the layer's destination rect, so adjacent layers tile without gaps.
++ */
++void
++AppleCLCD::lilacPresent(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	uint32_t ry0 = fScaleH, ry1 = 0, ri0 = fScaleW, ri1 = 0;        /* changed scaled rect */
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		const uint8_t *a = rec + 0x64 + 16 * layer;
++		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (sweet_fb_swaps_logged < 16) {
++			sweet_fb_swaps_logged++;
++			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
++			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
++			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
++			    get32(a, 12), dx, dy, w, h);
++		}
++		if (s == NULL) {
++			continue;
++		}
++		uintptr_t src = s->kernelAddress();
++		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (w <= 0 || h <= 0) {
++			w = (int32_t)s->width;
++			h = (int32_t)s->height;
++		}
++		if (sx < 0 || sy < 0) {
++			sx = sy = 0;
++		}
++		if (dx < 0 || dy < 0) {
++			dx = dy = 0;
++		}
++		if (w > (int32_t)s->width - sx) {
++			w = (int32_t)s->width - sx;
++		}
++		if (h > (int32_t)s->height - sy) {
++			h = (int32_t)s->height - sy;
++		}
++		if (w > (int32_t)fLogicalW - dx) {
++			w = (int32_t)fLogicalW - dx;
++		}
++		if (h > (int32_t)fLogicalH - dy) {
++			h = (int32_t)fLogicalH - dy;
++		}
++		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		    (uint64_t)(sx + w) * 4;
++		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++		    s->memory == NULL || last > s->memory->getLength()) {
++			src = 0;
++		}
++		if (src != 0 && bpe == 4) {
++			uint32_t udx = (uint32_t)dx, udy = (uint32_t)dy;
++			uint32_t i0 = lilac_lower_bound(fColSrc, fScaleW, udx);
++			uint32_t i1 = lilac_lower_bound(fColSrc, fScaleW, udx + (uint32_t)w);
++			uint32_t j0 = lilac_lower_bound(fRowSrc, fScaleH, udy);
++			uint32_t j1 = lilac_lower_bound(fRowSrc, fScaleH, udy + (uint32_t)h);
++			const uint8_t *base = (const uint8_t *)src + s->offset + (uint64_t)sx * 4;
++			for (uint32_t j = j0; j < j1 && i0 < i1; j++) {
++				const uint8_t *row = base + (uint64_t)(sy + fRowSrc[j] - udy) * s->bytesPerRow;
++				uint8_t *d = fShadow + (uint64_t)(fScaleY + j) * fRowBytes + (uint64_t)(fScaleX + i0) * 3;
++				const uint16_t *cx = fColSrc + i0;
++				for (uint32_t n = i1 - i0; n != 0; n--) {
++					uint32_t v;
++					memcpy(&v, row + ((uint32_t)(*cx++ - udx) << 2), 4);       /* B,G,R,A */
++					d[0] = (uint8_t)v;
++					d[1] = (uint8_t)(v >> 8);
++					d[2] = (uint8_t)(v >> 16);
++					d += 3;
++				}
++			}
++			if (i0 < i1 && j0 < j1) {
++				ry0 = j0 < ry0 ? j0 : ry0;
++				ry1 = j1 > ry1 ? j1 : ry1;
++				ri0 = i0 < ri0 ? i0 : ri0;
++				ri1 = i1 > ri1 ? i1 : ri1;
++			}
++		}
++		s->release();
++	}
++	if (ry0 < ry1) {
++		lilacFlush(fScaleY + ry0, fScaleY + ry1, (fScaleX + ri0) * 3, (fScaleX + ri1) * 3);
++	}
++}
++#endif /* LILAC */
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..1815272 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -2243,6 +2621,83 @@ index 0631685..1815272 100644
  const char *
  SweetPlatformExpert::deleteList(void)
  {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..fd104bd 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -248,6 +248,51 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++#if defined(LILAC)
++/*
++ * LILAC's panel memory is 24 bpp, so it cannot be handed out as the BGRA
++ * default surface: the framebuffer publishes this buffer instead and scales
++ * it into the panel. Same memory as IOSurfaceRootUserClient::create (wired,
++ * kernel_task, user-shareable, default cache mode): the CPU renderer and the
++ * kernel copy both access it cached, with no mismatched-attribute alias.
++ */
++SweetSurface *
++sweet_surface_create_buffer(uint32_t width, uint32_t height, uint32_t bytesPerRow,
++    uint32_t pixelFormat)
++{
++	if (width == 0 || height == 0 || width > SWEET_SURFACE_MAX_DIM || height > SWEET_SURFACE_MAX_DIM ||
++	    bytesPerRow < (uint64_t)width * 4 || round_page((uint64_t)bytesPerRow * height) > SWEET_SURFACE_MAX_ALLOC) {
++		return NULL;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem == NULL) {
++		s->release();
++		return NULL;
++	}
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);     /* free() subtracts it */
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++#endif /* LILAC */
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..3c049fd 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,16 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++#if defined(LILAC)
++/*
++ * Publish a new zeroed wired kernel buffer (cached, like surfaces created by
++ * userland) as a 4-byte-per-pixel surface. Returns a retained surface that
++ * stays in the id table until released by the caller and every user.
++ */
++SweetSurface *sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++#endif /* LILAC */
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 index 92f3e26..e1c676f 100644
 --- a/iokit/KernelConfigTables.cpp
