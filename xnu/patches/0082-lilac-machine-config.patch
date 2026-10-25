@@ -12,15 +12,16 @@ index f2d8bf8..75ab7cf 100644
  SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
  sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..e69b986 100644
+index 6630131..2e3446a 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
+@@ -105,6 +105,9 @@ bsd/dev/random/randomdev.c		standard
  
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/lilac_sd.c			standard
 +bsd/dev/lilac_ufs.c			standard
++bsd/dev/lilac_disp.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
@@ -57,6 +58,177 @@ index 7fd9be1..69ebbb8 100644
  #define unix_syscall_kprintf(x...)      /* kprintf("unix_syscall: " x) */
  
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
+diff --git a/bsd/dev/lilac_disp.c b/bsd/dev/lilac_disp.c
+new file mode 100644
+index 0000000..3c3a2dd
+--- /dev/null
++++ b/bsd/dev/lilac_disp.c
+@@ -0,0 +1,165 @@
++/*
++ * LILAC (Xperia XZ1 Compact, MSM8998): display probe, stage 85 (lilac_stop=85).
++ *
++ * The panel is a 720x1280 DSI command-mode panel (somc lilac dtsi:
++ * qcom,mdss-dsi-panel-type = "dsi_cmd_mode"); UEFI's SimpleFbDxe draws into
++ * the continuous-splash RAM at 0x9D400000 (RGB888, stride 2160) and the
++ * bootloader-programmed MDP refreshes the panel from it. Whether that refresh
++ * survives into xnu decides whether a RAM framebuffer can show anything.
++ *
++ * Nothing here runs unless lilac_stop=85. MDSS/MMCC/GCC registers are only
++ * read, and only after the clocks that gate them read as running:
++ *   GCC  0x00100000 + 0x9004  gcc_mmss_noc_cfg_ahb_clk CBCR (any MMSS access depends on it)
++ *   MMCC 0x0C8C0000 + 0x2304  MDSS GDSCR (bit31 PWR_ON)
++ *                   + 0x2308/0x2310/0x231C  mdss_ahb/axi/mdp CBCR (bit31 CLK_OFF)
++ *   MDP  0x0C901000: pingpong_0 +0x70000 (+0x14 read pointer, +0x2C write pointer line,
++ *        +0x30 autorefresh config), SSPP VIG0-3 +0x4000.. / DMA0-3 +0x24000.. (+0x14 SRC0_ADDR,
++ *        +0x24 YSTRIDE0)  (Linux dpu_3_0_msm8998.h, dpu_hw_pingpong.c, dpu_hw_sspp.c).
++ * The only write is to the splash RAM itself (below xnu's physBase 0xA0000000,
++ * mapped device-nGnRE so no cache maintenance is needed): eight vertical
++ * colour bars, written once the MDSS clocks read as running, during the 20 s +
++ * 4 * nibble stop delay, so they are on screen if the panel is refreshing.
++ *
++ * Nibble: bit0 GCC MMSS NoC AHB clock running; bit1 MDSS GDSC on and AHB/AXI/MDP
++ * clocks running; bit2 pingpong_0 pointers move over 100 ms (frames are being
++ * sent); bit3 an SSPP scans out 0x9D400000 with stride 2160.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <arm64/sweet_early.h>
++
++#if defined(ARM64_BOARD_CONFIG_LILAC)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define GCC_MMSS_NOC_PA         0x00109000ULL
++#define GCC_MMSS_NOC_CBCR       0x004
++#define MMCC_MDSS_PA            0x0C8C2000ULL
++#define MMCC_MDSS_GDSCR         0x304
++#define MMCC_MDSS_AHB_CBCR      0x308
++#define MMCC_MDSS_AXI_CBCR      0x310
++#define MMCC_MDSS_MDP_CBCR      0x31C
++#define MDP_PA                  0x0C901000ULL
++#define MDP_PP0                 0x70000
++#define MDP_LEN                 0x72000
++#define PP_INT_COUNT_VAL        0x14
++#define PP_LINE_COUNT           0x2C
++#define PP_AUTOREFRESH_CONFIG   0x30
++#define SSPP_SRC0_ADDR          0x14
++#define SSPP_SRC_YSTRIDE0       0x24
++
++#define FB_PA                   0x9D400000ULL
++#define FB_W                    720u
++#define FB_H                    1280u
++#define FB_STRIDE               2160u
++
++static const uint32_t sspp_off[8] = {
++	0x4000, 0x6000, 0x8000, 0xa000, 0x24000, 0x26000, 0x28000, 0x2a000,
++};
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++lilac_disp_bars(void)
++{
++	static const uint8_t col[8][3] = {   /* bytes in memory order B, G, R (PixelBitMask R=0xFF0000) */
++		{ 0xFF, 0xFF, 0xFF }, { 0x00, 0xFF, 0xFF }, { 0xFF, 0xFF, 0x00 }, { 0x00, 0xFF, 0x00 },
++		{ 0xFF, 0x00, 0xFF }, { 0x00, 0x00, 0xFF }, { 0xFF, 0x00, 0x00 }, { 0x00, 0x00, 0x00 },
++	};
++	vm_offset_t fb = ml_io_map(FB_PA, (vm_size_t)FB_STRIDE * FB_H);
++	if (!fb) {
++		return;
++	}
++	for (uint32_t y = 0; y < FB_H; y++) {
++		volatile uint8_t *row = (volatile uint8_t *)(fb + (vm_offset_t)y * FB_STRIDE);
++		for (uint32_t x = 0; x < FB_W; x++) {
++			const uint8_t *c = col[(x * 8) / FB_W];
++			row[3 * x] = c[0];
++			row[3 * x + 1] = c[1];
++			row[3 * x + 2] = c[2];
++		}
++	}
++	__builtin_arm_dsb(0xF);
++}
++
++void lilac_disp_probe(void);
++
++void
++lilac_disp_probe(void)
++{
++	unsigned int nib = 0;
++
++	if (!lilac_stop_is(85)) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_MMSS_NOC_PA, PAGE_SIZE);
++	uint32_t noc = gcc ? rd(gcc, GCC_MMSS_NOC_CBCR) : 0xFFFFFFFFu;
++	printf("LILAC DISP: gcc_mmss_noc_cfg_ahb CBCR 0x%08x\n", noc);
++	if (!gcc || (noc & 0x80000000u)) {
++		lilac_report(85, nib);
++		return;
++	}
++	nib |= 1;
++
++	vm_offset_t mmcc = ml_io_map(MMCC_MDSS_PA, PAGE_SIZE);
++	if (!mmcc) {
++		lilac_report(85, nib);
++		return;
++	}
++	uint32_t gdsc = rd(mmcc, MMCC_MDSS_GDSCR), ahb = rd(mmcc, MMCC_MDSS_AHB_CBCR);
++	uint32_t axi = rd(mmcc, MMCC_MDSS_AXI_CBCR), mdp = rd(mmcc, MMCC_MDSS_MDP_CBCR);
++	printf("LILAC DISP: MDSS GDSCR 0x%08x ahb 0x%08x axi 0x%08x mdp 0x%08x\n", gdsc, ahb, axi, mdp);
++	if (!(gdsc & 0x80000000u) || ((ahb | axi | mdp) & 0x80000000u)) {
++		lilac_report(85, nib);
++		return;
++	}
++	nib |= 2;
++
++	vm_offset_t m = ml_io_map(MDP_PA, MDP_LEN);
++	if (!m) {
++		lilac_report(85, nib);
++		return;
++	}
++	uint32_t rp0 = rd(m, MDP_PP0 + PP_INT_COUNT_VAL), wp0 = rd(m, MDP_PP0 + PP_LINE_COUNT);
++	uint32_t ar = rd(m, MDP_PP0 + PP_AUTOREFRESH_CONFIG);
++	unsigned int rp_changes = 0, wp_changes = 0;
++	uint32_t rp = rp0, wp = wp0;
++	for (unsigned int i = 0; i < 1000; i++) {
++		delay(97 + (int)(i % 7));
++		uint32_t r = rd(m, MDP_PP0 + PP_INT_COUNT_VAL), w = rd(m, MDP_PP0 + PP_LINE_COUNT);
++		if (r != rp) {
++			rp_changes++;
++		}
++		if (w != wp) {
++			wp_changes++;
++		}
++		rp = r;
++		wp = w;
++	}
++	printf("LILAC DISP: pp0 autorefresh 0x%08x rdptr 0x%08x->0x%08x (%u changes) wrptr 0x%08x->0x%08x (%u changes)\n",
++	    ar, rp0, rp, rp_changes, wp0, wp, wp_changes);
++	if (wp_changes > 0 || (rp >> 16) != (rp0 >> 16)) {
++		nib |= 4;
++	}
++	for (unsigned int i = 0; i < 8; i++) {
++		uint32_t a = rd(m, sspp_off[i] + SSPP_SRC0_ADDR), s = rd(m, sspp_off[i] + SSPP_SRC_YSTRIDE0);
++		printf("LILAC DISP: sspp 0x%05x src0 0x%08x ystride0 0x%08x\n", sspp_off[i], a, s);
++		if (a == (uint32_t)FB_PA && (s & 0xFFFFu) == FB_STRIDE) {
++			nib |= 8;
++		}
++	}
++	/* RAM only (no MDSS access), so also when no motion was seen: the screen is the ground truth. */
++	lilac_disp_bars();
++	printf("LILAC DISP: colour bars written to 0x%llx\n", FB_PA);
++	lilac_report(85, nib);
++}
++
++#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
 index 0000000..4404c30
@@ -1666,7 +1838,7 @@ index 6b926fe..55a4cf5 100644
  		int error = sweet_ufs_init();
  		if (error) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..29a4220 100644
+index bb2a2bf..7835ff0 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -164,6 +164,11 @@
@@ -1681,7 +1853,7 @@ index bb2a2bf..29a4220 100644
  #include <sys/kern_overrides.h>         /* for init_system_override() */
  #include <sys/lockf.h>                  /* for lf_init() */
  #include <sys/fsctl.h>
-@@ -685,7 +690,33 @@ bsd_init(void)
+@@ -685,7 +690,38 @@ bsd_init(void)
  	 * Initialize the calendar.
  	 */
  	bsd_init_kprintf("calling IOKitInitializeTime\n");
@@ -1711,11 +1883,16 @@ index bb2a2bf..29a4220 100644
 +		extern void lilac_ufs_probe(void);
 +		lilac_ufs_probe();
 +	}
++	{
++		/* Stage 85: display probe, MDSS reads only (bsd/dev/lilac_disp.c). */
++		extern void lilac_disp_probe(void);
++		lilac_disp_probe();
++	}
 +#endif
  
  	/* Initialize the file systems. */
  	bsd_init_kprintf("calling vfsinit\n");
-@@ -874,11 +905,13 @@ bsd_init(void)
+@@ -874,11 +910,13 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling setconf\n");
  		setconf();
@@ -1729,7 +1906,7 @@ index bb2a2bf..29a4220 100644
  		if (0 == (err = vfs_mountroot())) {
  			break;
  		}
-@@ -1098,6 +1131,7 @@ bsdinit_task(void)
+@@ -1098,6 +1136,7 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
