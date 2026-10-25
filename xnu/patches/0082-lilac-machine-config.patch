@@ -59,10 +59,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..4806886
+index 0000000..4404c30
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,1105 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -84,7 +84,13 @@ index 0000000..4806886
 + * Step 2: read-only BSD disk sdroot0 / rsdroot0 over one MBR partition of the
 + * card (boot-arg sdpart=N, 1-4, default 2; it must have type 0xAF, Apple HFS),
 + * so rd=sdroot0 roots on it (IOFindBSDRoot, iokit/bsddev/IOKitBSDInit.cpp).
-+ * There is no write path: opens for writing and write requests fail with EROFS.
++ * Without boot-arg sdrw=1 there is no write path: opens for writing and write
++ * requests fail with EROFS. With sdrw=1 the partition must also not overlap
++ * LBA 0 or any other MBR entry; writes are then single-block CMD24 (synchronous:
++ * transfer complete is signalled after the card leaves busy) and may only hit
++ * LBAs inside that partition (sd_lba_writable). Stage 84 (lilac_stop=84,
++ * sdrw=1) is a write self-check on the partition's last block, see
++ * lilac_sd_write_check().
 + * Stage 68 reports the setup: bit0 MBR read, bit1 0x55AA, bit2 partition type
 + * 0xAF with a non-empty extent, bit3 device nodes created.
 + */
@@ -528,6 +534,7 @@ index 0000000..4806886
 +
 +static struct {
 +	bool     ready;
++	bool     writable;      /* sdrw=1 and the partition passed the overlap check */
 +	uint32_t first;         /* partition start, card LBA (512-byte blocks) */
 +	uint32_t nblocks;       /* partition length in 512-byte blocks */
 +	uint32_t secsize;       /* logical sector size presented to BSD */
@@ -542,8 +549,11 @@ index 0000000..4806886
 +	if (!sdd.ready) {
 +		return ENXIO;
 +	}
-+	return (flags & FWRITE) ? EROFS : 0;
++	return ((flags & FWRITE) && !sdd.writable) ? EROFS : 0;
 +}
++
++static int sd_write_blocks(uint32_t lba, uint32_t n, const uint8_t *buf);
++static void lilac_sd_write_check(void);
 +
 +static int
 +lilac_sd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
@@ -560,12 +570,14 @@ index 0000000..4806886
 +	uint32_t count = buf_count(bp);
 +	uint64_t part_bytes = (uint64_t)sdd.nblocks * SD_BLOCK;
 +
++	bool rd = (buf_flags(bp) & B_READ) != 0;
++
 +	buf_setresid(bp, count);
-+	if (!(buf_flags(bp) & B_READ)) {
++	if (!rd && !sdd.writable) {
 +		error = EROFS;
 +		goto done;
 +	}
-+	if ((off % SD_BLOCK) || (count % SD_BLOCK) || off > part_bytes || count > part_bytes - off) {
++	if (buf_blkno(bp) < 0 || (off % SD_BLOCK) || (count % SD_BLOCK) || off > part_bytes || count > part_bytes - off) {
 +		error = EINVAL;
 +		goto done;
 +	}
@@ -580,11 +592,18 @@ index 0000000..4806886
 +	for (uint32_t done = 0; done < count;) {
 +		uint32_t k = MIN((count - done) / SD_BLOCK, SD_MULTI_MAX);
 +		uint64_t lba = (off + done) / SD_BLOCK;
-+		error = sd_read_blocks(sdd.first + (uint32_t)lba, k, sdd.bounce);
++		if (rd) {
++			error = sd_read_blocks(sdd.first + (uint32_t)lba, k, sdd.bounce);
++			if (!error) {
++				memcpy(vaddr + done, sdd.bounce, k * SD_BLOCK);
++			}
++		} else {
++			memcpy(sdd.bounce, vaddr + done, k * SD_BLOCK);
++			error = sd_write_blocks(sdd.first + (uint32_t)lba, k, sdd.bounce);
++		}
 +		if (error) {
 +			break;
 +		}
-+		memcpy(vaddr + done, sdd.bounce, k * SD_BLOCK);
 +		done += k * SD_BLOCK;
 +		buf_setresid(bp, count - done);
 +	}
@@ -624,19 +643,24 @@ index 0000000..4806886
 +		*o = (uint64_t)sdd.nblocks * SD_BLOCK / sdd.secsize;
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*f = 0;
++		*f = sdd.writable ? 1 : 0;
 +		return 0;
 +	case DKIOCGETFEATURES:
 +		*f = 0;
 +		return 0;
 +	case DKIOCSYNCHRONIZE:
 +	case DKIOCSYNCHRONIZECACHE:
++		/*
++		 * Every write has completed on the card (busy released) before
++		 * its buf is done, and the SD cache (CMD48/49 enable) is never
++		 * turned on, so there is nothing to flush.
++		 */
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
 +		*o = (SD_MULTI_MAX * SD_BLOCK) / sdd.secsize;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = 0;
++		*o = sdd.writable ? (SD_MULTI_MAX * SD_BLOCK) / sdd.secsize : 0;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
@@ -672,9 +696,12 @@ index 0000000..4806886
 +}
 +
 +static int
-+lilac_sd_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++lilac_sd_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return EROFS;
++	if (!sdd.writable) {
++		return EROFS;
++	}
++	return physio(lilac_sd_strategy, NULL, dev, B_WRITE, minphys, uio, (int)sdd.secsize);
 +}
 +
 +static const struct bdevsw lilac_sd_bdevsw = {
@@ -708,9 +735,11 @@ index 0000000..4806886
 +lilac_sd_init(void)
 +{
 +	unsigned int part = 2, nib = 0;
++	uint32_t sdrw = 0;
 +	int error;
 +
 +	PE_parse_boot_argn("sdpart", &part, sizeof(part));
++	PE_parse_boot_argn("sdrw", &sdrw, sizeof(sdrw));
 +	if (part < 1 || part > 4) {
 +		return EINVAL;
 +	}
@@ -730,6 +759,23 @@ index 0000000..4806886
 +			nib |= 4;
 +			sdd.first = first;
 +			sdd.nblocks = n;
++			/* Writable only if no other used MBR entry overlaps it (LBA 0 is excluded by first != 0). */
++			bool alone = (nib & 2) != 0;
++			for (unsigned int i = 0; i < 4 && alone; i++) {
++				const uint8_t *o = sdd.bounce + 446 + 16 * i;
++				uint32_t of = o[8] | o[9] << 8 | o[10] << 16 | (uint32_t)o[11] << 24;
++				uint32_t on = o[12] | o[13] << 8 | o[14] << 16 | (uint32_t)o[15] << 24;
++				if (i == part - 1 || o[4] == 0 || on == 0) {
++					continue;
++				}
++				if ((uint64_t)of + on > (uint64_t)first && (uint64_t)first + n > (uint64_t)of) {
++					alone = false;
++				}
++			}
++			if (sdrw && !alone) {
++				printf("LILAC SD: sdrw refused: partition %u overlaps another MBR entry\n", part);
++			}
++			sdd.writable = sdrw && alone;
 +		}
 +	}
 +	if (nib == 7) {
@@ -740,15 +786,23 @@ index 0000000..4806886
 +		}
 +		if (sdd.bmajor >= 0 && sdd.cmajor >= 0) {
 +			sdd.bdev = makedev(sdd.bmajor, 0);
-+			devfs_make_node(sdd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0440, "sdroot0");
-+			devfs_make_node(makedev(sdd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0440, "rsdroot0");
++			int mode = sdd.writable ? 0640 : 0440;
++			devfs_make_node(sdd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, mode, "sdroot0");
++			devfs_make_node(makedev(sdd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, mode, "rsdroot0");
 +			sdd.ready = true;
 +			nib |= 8;
 +		}
 +	}
++	if (!sdd.ready) {
++		sdd.writable = false;
++	}
 +	printf("LILAC SD: partition %u: first 0x%x, %u blocks, setup 0x%x%s\n",
-+	    part, sdd.first, sdd.nblocks, nib, sdd.ready ? ", sdroot0 read-only" : "");
++	    part, sdd.first, sdd.nblocks, nib,
++	    !sdd.ready ? "" : sdd.writable ? ", sdroot0 read-write (sdrw=1)" : ", sdroot0 read-only");
 +	lilac_report(68, nib);
++	if (sdd.ready && lilac_stop_is(84)) {
++		lilac_sd_write_check();
++	}
 +	if (!sdd.ready) {
 +		return error ? error : ENXIO;
 +	}
@@ -843,13 +897,27 @@ index 0000000..4806886
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
 +}
 +
-+/* CMD24 for one 512-byte block, polled PIO; only blocks 1.. of the armed log partition. */
++/*
++ * The only LBAs the kernel may ever write: blocks 1.. of the armed log
++ * partition, and, with sdrw=1, the selected sdroot0 partition (which then
++ * overlaps no other MBR entry, so never LBA 0, partition 1 or the log).
++ */
++static bool
++sd_lba_writable(uint32_t lba)
++{
++	if (sl.armed && lba > sl.first && lba - sl.first < sl.nblocks) {
++		return true;
++	}
++	return sdd.writable && lba >= sdd.first && lba - sdd.first < sdd.nblocks;
++}
++
++/* CMD24 for one 512-byte block, polled PIO; only LBAs allowed by sd_lba_writable(). */
 +static int
 +sd_write_block_hw(uint32_t lba, const uint8_t *buf, uint32_t *stp)
 +{
 +	uint32_t st = 0;
 +	*stp = 0;
-+	if (!sl.armed || lba <= sl.first || lba - sl.first >= sl.nblocks) {
++	if (!sd_lba_writable(lba)) {
 +		return EPERM;
 +	}
 +	if (!(sd_rd(HC_PRESENT) & PS_WRITABLE)) {
@@ -909,6 +977,66 @@ index 0000000..4806886
 +		printf("LILAC SDLOG: CMD24 lba 0x%x failed %d, int 0x%08x\n", lba, error, st);
 +	}
 +	return error;
++}
++
++/* sdroot0 writes: n blocks, one CMD24 each, claiming the controller per block. */
++static int
++sd_write_blocks(uint32_t lba, uint32_t n, const uint8_t *buf)
++{
++	uint32_t st;
++	for (uint32_t i = 0; i < n; i++) {
++		(void)sd_claim(true);
++		int error = sd_write_block_hw(lba + i, buf + i * SD_BLOCK, &st);
++		sd_release();
++		if (error) {
++			printf("LILAC SD: CMD24 lba 0x%x failed %d, int 0x%08x\n", lba + i, error, st);
++			return error;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Stage 84 (sdrw=1, lilac_stop=84): write path self-check on the last block of
++ * the selected partition (outside HFS+ structures: the alternate volume header
++ * is the second-to-last 512-byte block). bit0 the guard (sd_lba_writable)
++ * allows the partition's first and last block and refuses LBA 0 and the
++ * blocks just before and after it; bit1 rewriting the block's own data succeeds and reads back equal; bit2 a
++ * complemented pattern written there reads back; bit3 the original data is
++ * restored and reads back.
++ */
++static void
++lilac_sd_write_check(void)
++{
++	static uint8_t orig[SD_BLOCK], pat[SD_BLOCK], back[SD_BLOCK];
++	uint32_t lba = sdd.first + sdd.nblocks - 1;
++	unsigned int nib = 0;
++
++	/* The guard alone, without issuing any command. */
++	if (sdd.writable && sd_lba_writable(sdd.first) && sd_lba_writable(lba) &&
++	    !sd_lba_writable(0) && !sd_lba_writable(sdd.first - 1) &&
++	    !sd_lba_writable(sdd.first + sdd.nblocks)) {
++		nib |= 1;
++	}
++	if (sdd.writable && sd_read_blocks(lba, 1, orig) == 0) {
++		if (sd_write_blocks(lba, 1, orig) == 0 && sd_read_blocks(lba, 1, back) == 0 &&
++		    memcmp(orig, back, SD_BLOCK) == 0) {
++			nib |= 2;
++		}
++		for (uint32_t i = 0; i < SD_BLOCK; i++) {
++			pat[i] = (uint8_t)~orig[i];
++		}
++		if ((nib & 2) && sd_write_blocks(lba, 1, pat) == 0 && sd_read_blocks(lba, 1, back) == 0 &&
++		    memcmp(pat, back, SD_BLOCK) == 0) {
++			nib |= 4;
++		}
++		if (sd_write_blocks(lba, 1, orig) == 0 && sd_read_blocks(lba, 1, back) == 0 &&
++		    memcmp(orig, back, SD_BLOCK) == 0) {
++			nib |= 8;
++		}
++	}
++	printf("LILAC SD: write check lba 0x%x nibble 0x%x\n", lba, nib);
++	lilac_report(84, nib);
 +}
 +
 +/* Copy console bytes not yet on the card, then the header. */
@@ -2752,10 +2880,10 @@ index b0dad49..05530f8 100644
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 437adb1..06f23cd 100644
+index 437adb1..cfddf19 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -1072,10 +1072,14 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -1072,10 +1072,36 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  {
  #pragma clang diagnostic pop
  
@@ -2765,7 +2893,29 @@ index 437adb1..06f23cd 100644
  	sweet_early_panic(panic_format_str, panic_args);
  #endif
 +#if defined(LILAC)
-+	/* No console exists to report the panic; encode it as a timed reset. */
++	/*
++	 * No console exists to report the panic; encode it as a timed reset. Put
++	 * the panic string into the console ring first (lock-free), so the SD log
++	 * flush inside the reset carries it.
++	 */
++	{
++		extern void sweet_log_append(const char *c, int size);
++		char msg[512];
++		int n = snprintf(msg, sizeof(msg), "\nLILAC PANIC (caller 0x%lx, options 0x%llx): ",
++		    (unsigned long)VM_KERNEL_UNSLIDE(panic_caller), panic_options_mask);
++		if (n > 0 && n < (int)sizeof(msg) && panic_format_str != NULL && panic_args != NULL) {
++			va_list copy;
++			va_copy(copy, *panic_args);
++			int m = vsnprintf(msg + n, sizeof(msg) - (size_t)n - 1, panic_format_str, copy);
++			va_end(copy);
++			n = (m > 0) ? MIN(n + m, (int)sizeof(msg) - 2) : n;
++		}
++		if (n > 0) {
++			n = MIN(n, (int)sizeof(msg) - 2);
++			msg[n++] = '\n';
++			sweet_log_append(msg, n);
++		}
++	}
 +	lilac_fatal_reset();
 +#endif
  
