@@ -59,10 +59,10 @@ index 7fd9be1..69ebbb8 100644
  	if (kdebug_enable && !code_is_kdebug_trace(code)) {
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..86fe426
+index 0000000..4806886
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,976 @@
+@@ -0,0 +1,977 @@
 +/*
 + * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
 + *
@@ -1033,6 +1033,7 @@ index 0000000..86fe426
 +	sl.armed = true;
 +	printf("LILAC SDLOG: console log to SD partition %d (LBA 0x%x, %u blocks), ring %u KiB\n",
 +	    found + 1, first, n, ring >> 10);
++	printf("LILAC VM: page size %u (hardware granule 4096)\n", (unsigned)PAGE_SIZE);
 +	lilac_reset_hook = sdlog_reset_hook;
 +	if (kernel_thread_start(sdlog_thread, NULL, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
@@ -2060,7 +2061,7 @@ index 9a748ea..9e3e013 100644
  
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..85c17c0 100644
+index 42362c5..e78b698 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -347,6 +347,9 @@ arm_init(
@@ -2073,6 +2074,27 @@ index 42362c5..85c17c0 100644
  	sweet_early_mark(1, "arm_init entered (MMU on)");
  
  	arm_setup_pre_sign();
+@@ -413,6 +416,20 @@ arm_init(
+ 			 */
+ 			PAGE_SHIFT_CONST = ARM_PGSHIFT;
+ 		}
++#if defined(LILAC)
++		/*
++		 * lilac_vm16k=1: 16KB VM pages on the 4KB granule (PAGE_RATIO 4), the mode
++		 * xnu uses for 4KB-granule SoCs with > 1GB. iOS 16 userland needs it: the
++		 * dyld shared cache is code-signed with 16KB hash pages, which
++		 * cs_validate_codedirectory() rejects unless PAGE_SHIFT is 14.
++		 */
++		{
++			uint32_t vm16k = 0;
++			if (PE_parse_boot_argn("lilac_vm16k", &vm16k, sizeof(vm16k)) && vm16k == 1) {
++				PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
++			}
++		}
++#endif
+ 
+ 		/* 32-bit apps always see 16KB page size */
+ 		page_shift_user32 = PAGE_MAX_SHIFT;
 diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
 index da0bbba..87867be 100644
 --- a/osfmk/arm/commpage/commpage_asm.s
