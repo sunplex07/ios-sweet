@@ -231,20 +231,20 @@ index 0000000..3c3a2dd
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
 diff --git a/bsd/dev/lilac_sd.c b/bsd/dev/lilac_sd.c
 new file mode 100644
-index 0000000..12c3810
+index 0000000..568f9eb
 --- /dev/null
 +++ b/bsd/dev/lilac_sd.c
-@@ -0,0 +1,1244 @@
+@@ -0,0 +1,1607 @@
 +/*
-+ * LILAC microSD (MSM8998 SDHC2) access, step 1: read-only probe.
++ * LILAC microSD (MSM8998 SDHC2): ADMA2 strategy I/O, PIO probe/log/fallback.
 + *
 + * Hardware (mainline msm8998.dtsi sdhc2, qcom,sdhci-msm-v4): standard SDHCI
 + * registers at 0x0c0a4900, MSM core registers at 0x0c0a4000. No SMMU.
 + * UEFI SdccDxe leaves the card selected in transfer state, 4-bit bus, clocks
 + * running and interrupt signals off (G17-SDP register dump), so this code
 + * reuses that state: it never touches clocks, power, bus width or the card's
-+ * identification, and issues only CMD17 (READ_SINGLE_BLOCK) through the PIO
-+ * buffer data port. Nothing is ever written to the card.
++ * identification. Probes and the SD log use PIO; sdroot0 strategy uses ADMA2
++ * unless sddma=0 or unavailable. Only the guarded paths below may write.
 + *
 + * Probe (bsd_init, only when lilac_stop is 65, 66 or 67):
 + *   65: read LBA 0          expect nibble 0xF
@@ -258,8 +258,8 @@ index 0000000..12c3810
 + * so rd=sdroot0 roots on it (IOFindBSDRoot, iokit/bsddev/IOKitBSDInit.cpp).
 + * Without boot-arg sdrw=1 there is no write path: opens for writing and write
 + * requests fail with EROFS. With sdrw=1 the partition must also not overlap
-+ * LBA 0 or any other MBR entry; writes are then single-block CMD24 (synchronous:
-+ * transfer complete is signalled after the card leaves busy) and may only hit
++ * LBA 0 or any other MBR entry; strategy writes use CMD25/CMD24 ADMA2 with
++ * PIO CMD24 fallback (synchronous: wait for card busy to end) and may only hit
 + * LBAs inside that partition (sd_lba_writable). Stage 84 (lilac_stop=84,
 + * sdrw=1) is a write self-check on the partition's last block, see
 + * lilac_sd_write_check().
@@ -287,6 +287,12 @@ index 0000000..12c3810
 +#include <machine/atomic.h>
 +#include <libkern/crc.h>
 +#include <arm64/sweet_early.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "lilac_sd_adma.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);   /* as bsd/dev/sweet_ufs.c */
 +
@@ -335,7 +341,39 @@ index 0000000..12c3810
 +#define SD_BLOCK        512u
 +#define SD_MULTI_MAX    128u            /* blocks per CMD18 (64 KiB) */
 +
++/* Register encodings: Linux 4.14 drivers/mmc/host/sdhci.h:35-45,83-89,
++ * 122-123,211-219,254-259,276-283. Byte accesses preserve power/clock state.
++ */
++#define HC_CONTROL      0x28
++#define HC_CAPS         0x40
++#define HC_ADMA_ERROR   0x54
++#define HC_ADMA_LO      0x58
++#define HC_ADMA_HI      0x5c
++#define HC_VERSION      0xfe
++#define CAP_ADMA2       (1u << 19)
++#define CAP_64BIT       (1u << 28)
++#define CTRL_DMA_MASK   0x18u
++#define CTRL_ADMA32     0x10u
++#define CTRL_ADMA64     0x18u
++#define XFER_DMA        1u
++#define XFER_AUTO12     (1u << 2)
++#define R1_ILLEGAL_CMD  (1u << 22)
++#define SD_DMA_BYTES    (SD_MULTI_MAX * SD_BLOCK)
++#define SD_DMA_NAP_US   150
++
 +static vm_offset_t sd_regs;
++static bool sd_dma_fatal; /* failed line reset: no subsequent controller command */
++static struct {
++	vm_offset_t mem;
++	uint64_t pa;
++	bool initialized, enabled, wide, writes, verified, cmd25;
++} sda;
++
++static void sd_dma_init(void);
++static int sd_dma_hw(bool rd, uint32_t first, uint32_t count,
++    uint32_t lba, uint32_t n, uint8_t *buf, uint32_t *stp);
++static int sd_strategy_transfer(bool rd, uint32_t lba, uint32_t n, uint8_t *buf,
++    bool *used_dma, bool *used_pio);
 +
 +static void
 +sd_map(void)
@@ -394,6 +432,7 @@ index 0000000..12c3810
 +static struct {
 +	uint32_t rd_req, rd_blk, wr_req, wr_blk;
 +	uint64_t rd_abs, wr_abs, max_abs;
++	uint32_t dma, pio, err; /* strategy requests; fallback counts in both */
 +	uint32_t naps;
 +	uint64_t nap_abs;
 +	struct { int32_t pid; uint32_t blk; char name[17]; } top[SDS_PIDS];
@@ -491,6 +530,9 @@ index 0000000..12c3810
 +static int
 +sd_wait_present_clear(uint32_t mask, uint32_t usec)
 +{
++	if (sd_dma_fatal) {
++		return EIO;
++	}
 +	uint64_t end = sd_deadline(usec), spin_end = sd_deadline(SD_SPIN_US);
 +	while (sd_rd(HC_PRESENT) & mask) {
 +		if (mach_absolute_time() > end) {
@@ -502,15 +544,18 @@ index 0000000..12c3810
 +}
 +
 +/* Software reset of the CMD and DAT state machines after an error (card state untouched). */
-+static void
++static bool
 +sd_reset_lines(void)
 +{
-+	uint32_t v = sd_rd(HC_RESET);
-+	sd_wr(HC_RESET, v | RESET_CMD | RESET_DAT);
++	/* Write ONLY reset CMD/DAT, never echo a full-reset bit or clock bits. */
++	volatile uint8_t *reset = (volatile uint8_t *)(sd_regs + SD_HC + HC_RESET + 3);
++	*reset = 6;
 +	uint64_t end = sd_deadline(100000);
-+	while ((sd_rd(HC_RESET) & (RESET_CMD | RESET_DAT)) && mach_absolute_time() < end) {
++	while ((*reset & 6) && mach_absolute_time() < end) {
 +	}
++	bool ok = (*reset & 6) == 0;
 +	sd_wr(HC_INT_STATUS, 0xFFFFFFFFu);
++	return ok;
 +}
 +
 +/* CMD17 for one 512-byte block (SDHC/SDXC block addressing), polled PIO. */
@@ -720,7 +765,7 @@ index 0000000..12c3810
 +{
 +	static uint8_t chunk[SD_MULTI_MAX * SD_BLOCK], single[SD_MULTI_MAX * SD_BLOCK];
 +	unsigned int nib = 0;
-+	uint32_t crc = 0, first;
++	uint32_t crc = 0, first, p2_count;
 +	uint64_t t0, t1, t2, multi_ns = 0, single_ns = 0;
 +	bool ok = true;
 +
@@ -730,6 +775,11 @@ index 0000000..12c3810
 +		return;
 +	}
 +	first = chunk[446 + 16 + 8] | chunk[446 + 16 + 9] << 8 | chunk[446 + 16 + 10] << 16 | (uint32_t)chunk[446 + 16 + 11] << 24;
++	p2_count = chunk[474] | chunk[475] << 8 | chunk[476] << 16 | (uint32_t)chunk[477] << 24;
++	if (!sd_adma_range(first, p2_count, first, SD69_BYTES / SD_BLOCK)) {
++		lilac_report(69, 0);
++		return;
++	}
 +	t0 = mach_absolute_time();
 +	for (uint32_t off = 0; off < SD69_BYTES && ok; off += sizeof(chunk)) {
 +		ok = sd_read_blocks(first + off / SD_BLOCK, SD_MULTI_MAX, chunk) == 0;
@@ -765,6 +815,30 @@ index 0000000..12c3810
 +		    multi_ns / 1000, multi_ns ? (4096ull * 1000000000ull) / multi_ns : 0, crc, m64 / 1000, single_ns / 1000);
 +	}
 +	printf("LILAC SD: CMD18 check nibble 0x%x\n", nib);
++	sd_dma_init();
++	if (sda.enabled) {
++		uint32_t dma_crc = 0, st = 0;
++		bool dma_ok = (nib & 1) && sd_adma_range(first, p2_count, first, SD69_BYTES / SD_BLOCK);
++		t0 = mach_absolute_time();
++		for (uint32_t off = 0; dma_ok && off < SD69_BYTES; off += sizeof(chunk)) {
++			(void)sd_claim(true);
++			dma_ok = sd_dma_hw(true, first, p2_count, first + off / SD_BLOCK,
++			    SD_MULTI_MAX, chunk, &st) == 0;
++			sd_release();
++			if (dma_ok) {
++				dma_crc = crc32(dma_crc, chunk, sizeof(chunk));
++			}
++		}
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		bool match = dma_ok && dma_crc == crc;
++		printf("LILAC SD: DMA check: 4 MiB in %llu us (%llu KiB/s) crc 0x%08x pio crc 0x%08x %s\n",
++		    ns / 1000, ns ? 4096ull * NSEC_PER_SEC / ns : 0, dma_crc, crc, match ? "match" : "MISMATCH");
++		if (!match) {
++			sda.enabled = sda.writes = false;
++			printf("LILAC SD: DMA disabled for this boot (check failed)\n");
++		}
++	}
 +	lilac_report(69, nib);
 +}
 +
@@ -867,25 +941,21 @@ index 0000000..12c3810
 +		goto done;
 +	}
 +	uint64_t t_req = mach_absolute_time();
++	bool used_dma = false, used_pio = false;
 +	lck_mtx_lock(&lilac_sd_lock);
 +	for (uint32_t done = 0; done < count;) {
 +		uint32_t k = MIN((count - done) / SD_BLOCK, SD_MULTI_MAX);
 +		uint64_t lba = (off + done) / SD_BLOCK;
-+		if (rd) {
-+			error = sd_read_blocks(sdd.first + (uint32_t)lba, k, sdd.bounce);
-+			if (!error) {
-+				memcpy(vaddr + done, sdd.bounce, k * SD_BLOCK);
-+			}
-+		} else {
-+			memcpy(sdd.bounce, vaddr + done, k * SD_BLOCK);
-+			error = sd_write_blocks(sdd.first + (uint32_t)lba, k, sdd.bounce);
-+		}
++		error = sd_strategy_transfer(rd, sdd.first + (uint32_t)lba, k,
++		    (uint8_t *)vaddr + done, &used_dma, &used_pio);
 +		if (error) {
 +			break;
 +		}
 +		done += k * SD_BLOCK;
 +		buf_setresid(bp, count - done);
 +	}
++	sds.dma += used_dma ? 1u : 0u;
++	sds.pio += used_pio ? 1u : 0u;
 +	sd_stat_request(rd, count / SD_BLOCK, mach_absolute_time() - t_req);
 +	lck_mtx_unlock(&lilac_sd_lock);
 +	buf_unmap(bp);
@@ -913,9 +983,9 @@ index 0000000..12c3810
 +	uint32_t naps = os_atomic_xchg(&sds.naps, 0u, relaxed);
 +	uint64_t nap_abs = os_atomic_xchg(&sds.nap_abs, 0ull, relaxed);
 +
-+	printf("LILAC SDSTAT rd %u req %u KiB %u ms | wr %u req %u KiB %u ms | max %u ms | naps %u %u ms\n",
++	printf("LILAC SDSTAT rd %u req %u KiB %u ms | wr %u req %u KiB %u ms | max %u ms | naps %u %u ms | dma %u pio %u err %u\n",
 +	    s.rd_req, s.rd_blk / 2, sd_abs_ms(s.rd_abs), s.wr_req, s.wr_blk / 2, sd_abs_ms(s.wr_abs),
-+	    sd_abs_ms(s.max_abs), naps, sd_abs_ms(nap_abs));
++	    sd_abs_ms(s.max_abs), naps, sd_abs_ms(nap_abs), s.dma, s.pio, s.err);
 +	for (uint32_t i = 0; i < SDS_PIDS; i++) {
 +		if (s.top[i].blk != 0) {
 +			printf("LILAC SDSTAT  pid %d %s %u KiB\n", s.top[i].pid, s.top[i].name, s.top[i].blk / 2);
@@ -1082,7 +1152,8 @@ index 0000000..12c3810
 +			if (sdrw && !alone) {
 +				printf("LILAC SD: sdrw refused: partition %u overlaps another MBR entry\n", part);
 +			}
-+			sdd.writable = sdrw && alone;
++			/* Partition 1 stays protected even with a forged HFS type. */
++			sdd.writable = sdrw == 1 && alone && part != 1;
 +		}
 +	}
 +	if (nib == 7) {
@@ -1106,6 +1177,9 @@ index 0000000..12c3810
 +	printf("LILAC SD: partition %u: first 0x%x, %u blocks, setup 0x%x%s\n",
 +	    part, sdd.first, sdd.nblocks, nib,
 +	    !sdd.ready ? "" : sdd.writable ? ", sdroot0 read-write (sdrw=1)" : ", sdroot0 read-only");
++	if (sdd.ready) {
++		sd_dma_init();
++	}
 +	lilac_report(68, nib);
 +	if (sdd.ready && lilac_stop_is(84)) {
 +		lilac_sd_write_check();
@@ -1301,6 +1375,294 @@ index 0000000..12c3810
 +}
 +
 +/*
++ * ADMA design/source audit (paths relative to the named Linux trees):
++ * downstream 4.14 arch/arm64/boot/dts/qcom/msm8998.dtsi:1617-1658 and
++ * msm8998-yoshino-common.dtsi:3223-3227; mainline 6.18.58 msm8998.dtsi:
++ * 2268-2283 and msm8998-sony-xperia-yoshino.dtsi:661-671: no iommus and
++ * no dma-coherent for SDCC2. This is a physical-address DMA master, not an
++ * SMMU stream requiring an unproven UEFI bypass assumption.
++ *
++ * downstream drivers/mmc/host/sdhci-msm.c:4993-5014: preserve HC mode,
++ * enable length-error reporting only (VENDOR_SPEC bit7); do NOT replay POR,
++ * clock, power, DLL or capability overrides. Offsets: :258-264, HC_MODE :67.
++ * :5061 requires END on TRAN, :4613-4618 reset workaround is 8916/8992 only.
++ * mainline sdhci-msm.c:2493-2494 broken 64-bit DMA is 8916 only, not 8998;
++ * :2140-2181 distinguishes 12-byte legacy ADMA from 16-byte CQE descriptors.
++ * We do not enable CQE or SDHCI v4 mode. :2474 requests auto-CMD12 reads.
++ *
++ * One wired, contiguous allocation: a whole VM page for descriptors, then
++ * 64 KiB of data, serialized by sd_claim. Copying normal RAM once is simpler
++ * than DMA into arbitrary buf pages (unaligned cache lines, 16K VM/4K MMU
++ * granules). No CPU touches these cache lines while hardware owns them.
++ * flush_dcache64 is clean+invalidate to PoC plus dsb sy (arm64/caches_asm.s:
++ * 363-448), before both directions and after reads. This also cleans table
++ * fetches. No coherency assumption, no virtual addresses given to hardware.
++ *
++ * Completion: at most 20 us initial spin, then 150 us delay, which blocks
++ * with interrupts/preemption enabled (kern/clock.c:1584-1600); panic spins.
++ * Expected saving is removal of 16384 MMIO loads/stores per 64 KiB plus
++ * per-block polling; actual CPU-time/throughput savings require an A/B boot.
++ */
++static void
++sd_dma_init(void)
++{
++	uint32_t on = 1, caps, mode;
++	uint16_t host_version, ctrl2;
++	vm_size_t size = PAGE_SIZE + SD_DMA_BYTES;
++	ppnum_t pn, max_pnum;
++	if (sda.initialized) {
++		return;
++	}
++	sda.initialized = true;
++	PE_parse_boot_argn("sddma", &on, sizeof(on));
++	if (!on) {
++		printf("LILAC SD: ADMA disabled (sddma=0)\n");
++		return;
++	}
++	host_version = *(volatile uint16_t *)(sd_regs + SD_HC + HC_VERSION);
++	caps = sd_rd(HC_CAPS);
++	mode = *(volatile uint32_t *)(sd_regs + 0x78);
++	/* Refuse unsupported modes rather than change firmware's bus setup.
++	 * Mainline sdhci.h:246,384: v4 mode needs a different descriptor format.
++	 */
++	ctrl2 = *(volatile uint16_t *)(sd_regs + SD_HC + 0x3e);
++	if (!(caps & CAP_ADMA2) || (host_version & 0xff) < 2 || !(mode & 1) || (ctrl2 & (1u << 12))) {
++		printf("LILAC SD: ADMA unavailable cap 0x%x ver 0x%x hc 0x%x\n", caps, host_version, mode);
++		return;
++	}
++	sda.wide = (caps & CAP_64BIT) != 0;
++	/* max_pnum is in VM pages, not 4K hardware granules. */
++	max_pnum = sda.wide ? 0 : (ppnum_t)(UINT32_MAX >> PAGE_SHIFT);
++	if (kmem_alloc_contig(kernel_map, &sda.mem, size, PAGE_MASK, max_pnum, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("LILAC SD: ADMA allocation failed, PIO only\n");
++		return;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)sda.mem);
++	sda.pa = ptoa_64(pn);
++	if (!pn || (sda.pa & PAGE_MASK) ||
++	    (!sda.wide && sda.pa + size - 1 > UINT32_MAX)) {
++		printf("LILAC SD: ADMA physical address rejected, PIO only\n");
++		return;
++	}
++	/* Assert the allocator's contiguity at VM-page increments, not MMU PFNs. */
++	for (vm_size_t off = 0; off < size; off += PAGE_SIZE) {
++		if (ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(sda.mem + off))) != sda.pa + off) {
++			printf("LILAC SD: ADMA noncontiguous allocation, PIO only\n");
++			return;
++		}
++	}
++	sda.enabled = sda.writes = sda.cmd25 = true;
++	printf("LILAC SD: ADMA%u ready cap 0x%x ver 0x%x pa 0x%llx, 64 KiB bounce\n",
++	    sda.wide ? 64u : 32u, caps, host_version, sda.pa);
++}
++
++static int
++sd_dma_wait(uint32_t want, uint32_t usec, uint32_t *stp)
++{
++	uint64_t end = sd_deadline(usec), spin_end = sd_deadline(SD_SPIN_US);
++	for (;;) {
++		uint32_t st = sd_rd(HC_INT_STATUS);
++		*stp = st;
++		if (st & (INT_ERROR | INT_ERR_MASK)) {
++			return EIO;
++		}
++		if (st & want) {
++			return 0;
++		}
++		if (mach_absolute_time() > end) {
++			return ETIMEDOUT;
++		}
++		if (mach_absolute_time() > spin_end && !panic_active()) {
++			uint64_t t0 = mach_absolute_time();
++			delay(SD_DMA_NAP_US);
++			os_atomic_inc(&sds.naps, relaxed);
++			os_atomic_add(&sds.nap_abs, mach_absolute_time() - t0, relaxed);
++		}
++	}
++}
++
++/* sd_claim held. Range and write guards precede ALL commands, including STOP.
++ * Read range is either sdd or the MBR-validated p2 extent at stage 69.
++ * Only strategy/write-check callers reach DMA; the log never does.
++ */
++static int
++sd_dma_hw(bool rd, uint32_t first, uint32_t count, uint32_t lba,
++    uint32_t n, uint8_t *buf, uint32_t *stp)
++{
++	*stp = 0;
++	if (!sda.enabled || (!rd && !sda.writes) || sd_dma_fatal) {
++		return ENXIO;
++	}
++	if (n > SD_MULTI_MAX || !sd_adma_range(first, count, lba, n)) {
++		return EINVAL;
++	}
++	if (!rd) {
++		if (!sdd.writable || !sd_adma_range(sdd.first, sdd.nblocks, lba, n)) {
++			return EPERM;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			if (lba + i == 0 || !sd_lba_writable(lba + i)) {
++				return EPERM;
++			}
++		}
++		if (!(sd_rd(HC_PRESENT) & PS_WRITABLE)) {
++			return EROFS;
++		}
++	}
++	if (sd_wait_present_clear(PS_CMD_INHIBIT | PS_DAT_INHIBIT, 100000)) {
++		return EBUSY;
++	}
++	uint32_t bytes = n * SD_BLOCK;
++	uint8_t *data = (uint8_t *)(sda.mem + PAGE_SIZE);
++	size_t table_bytes = sd_adma_build((uint8_t *)sda.mem, PAGE_SIZE, sda.pa,
++	    sda.pa + PAGE_SIZE, bytes, PAGE_SIZE, sda.wide);
++	if (!table_bytes) {
++		return EINVAL;
++	}
++	if (!rd) {
++		memcpy(data, buf, bytes);
++	}
++	flush_dcache64(sda.pa + PAGE_SIZE, bytes, TRUE);
++	flush_dcache64(sda.pa, (unsigned int)table_bytes, TRUE);
++
++	volatile uint8_t *ctrl = (volatile uint8_t *)(sd_regs + SD_HC + HC_CONTROL);
++	uint8_t old_ctrl = *ctrl;
++	uint32_t old_enable = sd_rd(HC_INT_ENABLE);
++	uint32_t old_vendor = sd_rd(0x10c);
++	*ctrl = (uint8_t)((old_ctrl & ~CTRL_DMA_MASK) | (sda.wide ? CTRL_ADMA64 : CTRL_ADMA32));
++	sd_wr(0x10c, old_vendor | (1u << 7)); /* length-mismatch ADMA error */
++	/* Status latching only; never enable IRQ signals at 0x38. */
++	sd_wr(HC_INT_ENABLE, old_enable | INT_CMD_DONE | INT_XFER_DONE | INT_ERROR | 0x03ff0000u);
++	sd_wr(HC_INT_STATUS, 0xffffffffu);
++	sd_wr(HC_ADMA_LO, (uint32_t)sda.pa);
++	if (sda.wide) {
++		sd_wr(HC_ADMA_HI, (uint32_t)(sda.pa >> 32));
++	}
++	/* Linux 4.14 sdhci.c:926-934: ADMA uses SDMA boundary bits = 0. */
++	sd_wr(HC_BLKSZ_CNT, n << 16 | SD_BLOCK);
++	sd_wr(HC_ARG, lba);
++	uint32_t cmd = rd ? (n == 1 ? 17u : 18u) : (n == 1 ? 24u : 25u);
++	uint32_t xfer = XFER_DMA | XFER_BLKCNT_EN | (rd ? XFER_READ : 0u);
++	if (n > 1) {
++		xfer |= XFER_MULTI | XFER_AUTO12;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	sd_wr(HC_XFER_CMD, ((cmd << 8 | CMD_DATA | CMD_IDX_CHECK | CMD_CRC_CHECK | CMD_RESP48) << 16) | xfer);
++	int error = sd_dma_wait(INT_CMD_DONE, 100000, stp);
++	if (!error) {
++		uint32_t r1 = sd_rd(HC_RESP0);
++		if (r1 & R1_ERRORS) {
++			*stp = r1;
++			error = (!rd && n > 1 && (r1 & R1_ERRORS) == R1_ILLEGAL_CMD) ? ENOTSUP : EIO;
++		}
++	}
++	if (!error) {
++		sd_wr(HC_INT_STATUS, INT_CMD_DONE);
++		error = sd_dma_wait(INT_XFER_DONE, 1000000, stp);
++	}
++	if (!error && !rd) {
++		/* Also require DAT0 high and the host out of DATA inhibit. */
++		uint64_t end = sd_deadline(1000000);
++		while (!(sd_rd(HC_PRESENT) & PS_DAT0) || (sd_rd(HC_PRESENT) & PS_DAT_INHIBIT)) {
++			if (mach_absolute_time() > end) {
++				error = ETIMEDOUT;
++				break;
++			}
++			if (!panic_active()) {
++				delay(SD_DMA_NAP_US);
++			}
++		}
++	}
++	if (error) {
++		uint32_t adma = sd_rd(HC_ADMA_ERROR), status = sd_rd(HC_INT_STATUS);
++		/* Quiesce DMA before any PIO retry or touching the bounce buffer. */
++		bool reset = sd_reset_lines();
++		if (reset) {
++			uint32_t stop_st = 0;
++			/* An interrupted transfer may leave the card in data/rcv state. */
++			int stop = sd_stop_transmission(&stop_st);
++			reset = sd_reset_lines();
++			/* Never retry a write while the card is still programming. */
++			reset = reset && stop == 0 && (sd_rd(HC_PRESENT) & PS_DAT0) != 0;
++		}
++		if (!reset) {
++			sd_dma_fatal = true; /* Permanent allocation quarantined; no new I/O. */
++			sda.enabled = false;
++		}
++		printf("LILAC SD: ADMA err %d CMD%u lba 0x%x n %u int 0x%x resp 0x%x adma 0x%x reset %s\n",
++		    error, cmd, lba, n, status, *stp, adma, reset ? "ok" : "FAILED");
++	}
++	/* PIO selection restored before releasing sd_claim (including panic log). */
++	*ctrl = (uint8_t)(old_ctrl & ~CTRL_DMA_MASK);
++	sd_wr(0x10c, old_vendor);
++	sd_wr(HC_INT_ENABLE, old_enable);
++	sd_wr(HC_INT_STATUS, 0xffffffffu);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (!error && rd) {
++		flush_dcache64(sda.pa + PAGE_SIZE, bytes, TRUE);
++		memcpy(buf, data, bytes);
++	}
++	return error;
++}
++
++/* Called with lilac_sd_lock held, except single-threaded boot write check. */
++static int
++sd_strategy_transfer(bool rd, uint32_t lba, uint32_t n, uint8_t *buf,
++    bool *used_dma, bool *used_pio)
++{
++	if (!sd_adma_range(sdd.first, sdd.nblocks, lba, n)) {
++		return EINVAL;
++	}
++	if (!rd && !sdd.writable) {
++		return EROFS;
++	}
++	int error = 0;
++	bool dma = sda.enabled && (rd || sda.writes) && !panic_active();
++	if (dma) {
++		uint32_t st = 0;
++		*used_dma = true;
++		(void)sd_claim(true);
++		if (rd || n == 1 || sda.cmd25) {
++			error = sd_dma_hw(rd, sdd.first, sdd.nblocks, lba, n, buf, &st);
++			if (error == ENOTSUP && !rd && n > 1) {
++				sda.cmd25 = false;
++				printf("LILAC SD: CMD25 rejected, future DMA writes use CMD24 batches\n");
++			}
++		} else {
++			for (uint32_t i = 0; i < n && !error; i++) {
++				error = sd_dma_hw(false, sdd.first, sdd.nblocks, lba + i, 1, buf + i * SD_BLOCK, &st);
++			}
++		}
++		if (!error && !rd && !sda.verified) {
++			/* PIO, still owning controller: no log write can interleave. */
++			error = n == 1 ? sd_read_block_hw(lba, sdd.bounce, &st) :
++			    sd_read_multi_hw(lba, n, sdd.bounce, &st);
++			if (!error && memcmp(buf, sdd.bounce, n * SD_BLOCK)) {
++				error = EIO;
++			}
++			sda.verified = !error;
++			if (error) {
++				sda.writes = false;
++			}
++			printf("LILAC SD: DMA write verify: %s%s\n", error ? "MISMATCH/error" : "match",
++			    error ? ", DMA writes disabled" : "");
++		}
++		sd_release();
++		if (!error) {
++			return 0;
++		}
++		sds.err++;
++		if (sd_dma_fatal) {
++			return EIO;
++		}
++	}
++	/* Exactly one PIO retry; its own error propagates. No recursive DMA. */
++	*used_pio = true;
++	return rd ? sd_read_blocks(lba, n, buf) : sd_write_blocks(lba, n, buf);
++}
++
++/*
 + * Stage 84 (sdrw=1, lilac_stop=84): write path self-check on the last block of
 + * the selected partition (outside HFS+ structures: the alternate volume header
 + * is the second-to-last 512-byte block). bit0 the guard (sd_lba_writable)
@@ -1330,7 +1692,8 @@ index 0000000..12c3810
 +		nib |= 1;
 +	}
 +	if (sdd.writable && sd_read_blocks(lba, 1, orig) == 0) {
-+		if (sd_write_blocks(lba, 1, orig) == 0 && sd_read_blocks(lba, 1, back) == 0 &&
++		bool used_dma = false, used_pio = false;
++		if (sd_strategy_transfer(false, lba, 1, orig, &used_dma, &used_pio) == 0 && sd_read_blocks(lba, 1, back) == 0 &&
 +		    memcmp(orig, back, SD_BLOCK) == 0) {
 +			nib |= 2;
 +		}
@@ -1444,7 +1807,7 @@ index 0000000..12c3810
 +			found = i;
 +		}
 +	}
-+	if (found < 0) {
++	if (found != 3) { /* Only p4 may be armed for SD logging. */
 +		return;
 +	}
 +	uint32_t first = le32(sl.buf + 446 + 16 * found + 8), n = le32(sl.buf + 446 + 16 * found + 12);
@@ -1479,6 +1842,73 @@ index 0000000..12c3810
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_LILAC */
+diff --git a/bsd/dev/lilac_sd_adma.h b/bsd/dev/lilac_sd_adma.h
+new file mode 100644
+index 0000000..d9a6dae
+--- /dev/null
++++ b/bsd/dev/lilac_sd_adma.h
+@@ -0,0 +1,61 @@
++/* Pure ADMA2 encoder, shared with tools/lilac_sd_adma_test.c.
++ * Caller supplies uint*_t, bool and size_t. All descriptor fields are LE.
++ * Linux 4.14 drivers/mmc/host/sdhci.h:299-325: 8/12-byte strides;
++ * sdhci.c:665-767 and sdhci-msm.c:5061: END on final TRAN, not a NOP.
++ */
++#ifndef LILAC_SD_ADMA_H
++#define LILAC_SD_ADMA_H
++
++static bool
++sd_adma_range(uint32_t first, uint32_t count, uint32_t lba, uint32_t n)
++{
++	return first != 0 && count != 0 && n != 0 &&
++	       (uint64_t)first + count <= UINT32_MAX &&
++	       lba >= first && lba - first < count && n <= count - (lba - first);
++}
++
++/* Contiguous data, split at VM page boundaries and at 64 KiB. Zero means
++ * invalid input/capacity; callers must NEVER publish a failed table.
++ * A 64-bit table base must be 8-aligned, but its standard stride is 12,
++ * NOT 16 (CQE/v4 mode is deliberately not enabled by this driver).
++ */
++static size_t
++sd_adma_build(uint8_t *table, size_t capacity, uint64_t table_pa,
++    uint64_t data_pa, uint32_t bytes, uint32_t vm_page_bytes, bool wide)
++{
++	uint32_t align = wide ? 8u : 4u;
++	size_t stride = wide ? 12u : 8u, used = 0;
++	if (!bytes || vm_page_bytes < align || (vm_page_bytes & (vm_page_bytes - 1)) ||
++	    (table_pa & (align - 1)) || (data_pa & (align - 1)) ||
++	    data_pa > UINT64_MAX - (bytes - 1u) ||
++	    (!wide && (data_pa + bytes - 1u > UINT32_MAX || table_pa > UINT32_MAX))) {
++		return 0;
++	}
++	while (bytes) {
++		uint8_t *d = table + used;
++		uint32_t len = vm_page_bytes - (uint32_t)(data_pa & (vm_page_bytes - 1));
++		if (len > 65536u) {
++			len = 65536u;
++		}
++		if (len > bytes) {
++			len = bytes;
++		}
++		if (used > capacity || stride > capacity - used ||
++		    table_pa > UINT64_MAX - used - (stride - 1) ||
++		    (!wide && table_pa + used + stride - 1 > UINT32_MAX)) {
++			return 0;
++		}
++		d[0] = (uint8_t)(0x21u | (len == bytes ? 2u : 0u)); /* VALID | TRAN | END */
++		d[1] = 0;
++		d[2] = (uint8_t)len; /* 0 encodes 65536 */
++		d[3] = (uint8_t)(len >> 8);
++		for (uint32_t i = 0; i < (wide ? 8u : 4u); i++) {
++			d[4 + i] = (uint8_t)(data_pa >> (8 * i));
++		}
++		used += stride;
++		bytes -= len;
++		data_pa += len;
++	}
++	return used;
++}
++#endif
 diff --git a/bsd/dev/lilac_ufs.c b/bsd/dev/lilac_ufs.c
 new file mode 100644
 index 0000000..b3fb907
@@ -4860,3 +5290,90 @@ index 88e524a..8a76c8b 100644
  
  #define MAX_L2_CLINE                   6
  #define MAX_CPUS                       8
+diff --git a/tools/lilac_sd_adma_test.c b/tools/lilac_sd_adma_test.c
+new file mode 100644
+index 0000000..7f5a710
+--- /dev/null
++++ b/tools/lilac_sd_adma_test.c
+@@ -0,0 +1,81 @@
++/* Host-only test; no device access. Run with a native C11 compiler, -Wall -Wextra -Werror. */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#include "../bsd/dev/lilac_sd_adma.h"
++
++static uint32_t le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void check(bool wide, uint64_t pa, uint32_t bytes, uint32_t page, size_t expected)
++{
++	uint8_t table[4096];
++	memset(table, 0xa5, sizeof(table));
++	size_t stride = wide ? 12 : 8;
++	size_t used = sd_adma_build(table, sizeof(table), 0xa0000000, pa, bytes, page, wide);
++	assert(used == expected * stride);
++	uint32_t total = 0;
++	for (size_t off = 0; off < used; off += stride) {
++		const uint8_t *d = table + off;
++		assert(d[0] == (off + stride == used ? 0x23 : 0x21));
++		assert(d[1] == 0);
++		uint32_t len = (uint32_t)d[2] | (uint32_t)d[3] << 8;
++		if (!len) len = 65536;
++		uint64_t addr = le32(d + 4);
++		if (wide) addr |= (uint64_t)le32(d + 8) << 32;
++		assert(addr == pa + total);
++		assert(len <= 65536 && len <= page - (addr & (page - 1)));
++		assert((addr & (wide ? 7u : 3u)) == 0);
++		total += len;
++	}
++	assert(total == bytes);
++	for (size_t i = used; i < sizeof(table); i++) assert(table[i] == 0xa5);
++}
++
++int main(void)
++{
++	uint8_t t[4096];
++	for (unsigned wide = 0; wide < 2; wide++) {
++		check(wide != 0, 0xa0010000, 65536, 16384, 4); /* XNU VM pages */
++		check(wide != 0, 0xa0010000, 65536, 4096, 16); /* not assumed VM size */
++		check(wide != 0, 0xa0013ff8, 32768, 16384, 3); /* partial first/last */
++		check(wide != 0, 0xa0020000, 131072, 131072, 2); /* length 0 = 64K */
++		check(wide != 0, 0xa0020000, 65544, 131072, 2);
++		check(wide != 0, 0xa0020000, 512, 16384, 1);
++		assert(!sd_adma_build(t, sizeof(t), 0x1000, 0x2000, 0, 16384, wide));
++		assert(!sd_adma_build(t, 7, 0x1000, 0x2000, 512, 16384, wide));
++		assert(!sd_adma_build(t, sizeof(t), 0x1001, 0x2000, 512, 16384, wide));
++		assert(!sd_adma_build(t, sizeof(t), 0x1000, 0x2001, 512, 16384, wide));
++		assert(!sd_adma_build(t, sizeof(t), 0x1000, 0x2000, 512, 0, wide));
++		assert(!sd_adma_build(t, sizeof(t), 0x1000, 0x2000, 512, 12288, wide));
++		assert(!sd_adma_build(t, sizeof(t), 0x1000, UINT64_MAX - 7, 512, 16384, wide));
++		/* Capacity failures must not overrun the table. */
++		memset(t, 0xa5, sizeof(t));
++		assert(!sd_adma_build(t, 16, 0x1000, 0x2000, 65536, 4096, wide));
++		for (size_t i = 16; i < sizeof(t); i++) assert(t[i] == 0xa5);
++	}
++	assert(sd_adma_build(t, sizeof(t), 0x1004, 0x2004, 512, 16384, false) == 8);
++	assert(!sd_adma_build(t, sizeof(t), 0x1004, 0x2000, 512, 16384, true));
++	assert(!sd_adma_build(t, sizeof(t), 0x1000, 0x2004, 512, 16384, true));
++	assert(!sd_adma_build(t, sizeof(t), 0x1000, 0xffffff00, 512, 16384, false));
++	assert(!sd_adma_build(t, sizeof(t), 0x100000000ull, 0x2000, 512, 16384, false));
++	assert(!sd_adma_build(t, sizeof(t), 0xfffffffc, 0x2000, 512, 16384, false));
++	check(true, 0x12345678000ull, 65536, 16384, 4);
++	/* No zero/LBA0, arithmetic wrap, cross-partition or boundary overrun. */
++	assert(sd_adma_range(2048, 8192, 2048, 8192));
++	assert(sd_adma_range(2048, 8192, 10239, 1));
++	assert(!sd_adma_range(0, 8192, 0, 1));
++	assert(!sd_adma_range(2048, 8192, 0, 1));
++	assert(!sd_adma_range(2048, 8192, 2047, 1));
++	assert(!sd_adma_range(2048, 8192, 10239, 2));
++	assert(!sd_adma_range(2048, 8192, 10240, 1));
++	assert(!sd_adma_range(2048, 8192, 2048, 0));
++	assert(!sd_adma_range(UINT32_MAX - 8, 16, UINT32_MAX - 8, 1));
++	puts("PASS: ADMA32/64 page splits, 64KiB lengths, LE/END/VALID/TRAN, alignment, bounds, LBA guards");
++	return 0;
++}
