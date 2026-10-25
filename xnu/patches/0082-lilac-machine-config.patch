@@ -2663,7 +2663,7 @@ index 0000000..65be5f9
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..232911c 100644
+index 2545cf9..1095a24 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -15,6 +15,9 @@
@@ -2733,7 +2733,7 @@ index 2545cf9..232911c 100644
  	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
  	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
  		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
-@@ -168,11 +190,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -168,13 +190,35 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
  		    i, topology->cpus[i].phys_id);
  	}
@@ -2750,7 +2750,25 @@ index 2545cf9..232911c 100644
 +#endif
  	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
  	    topology->num_cpus, topology->num_cpus);
++#if defined(LILAC)
++	{
++		/* SMP phase 1 marker (SD log): logical CPUs whose initCPU completed and whose
++		 * self-SGI arrived; bit i = logical CPU i = /cpus node i. */
++		uint32_t up = 0, mask = 0;
++		for (unsigned int i = 0; i < topology->num_cpus; i++) {
++			SweetCPU *c = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++			if (c != NULL && __atomic_load_n(&c->initialized, __ATOMIC_ACQUIRE) != 0 &&
++			    sweet_cpu_signal_is_enabled(i)) {
++				up++;
++				mask |= 1U << i;
++			}
++		}
++		IOLog("LILAC SMP: %u cpus up, mask 0x%x\n", up, mask);
++	}
++#endif
  	thread_terminate(current_thread());
+ }
+ 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 index a62416c..7f40865 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
@@ -3546,10 +3564,10 @@ index b082a10..510b0fd 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..557b23e
+index 0000000..4301927
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,329 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -3586,6 +3604,16 @@ index 0000000..557b23e
 + *                 (proximate-timer path, which bypasses lilac_idle_wait); restored on exit
 + * The steps exceed the ~9 s jitter of the UEFI-to-adb path seen in G1-G3.
 + * No allocation, locks or per-CPU state: usable from arm_init entry on.
++ *
++ * SMP (cpus=N > 1, SMP phase 1):
++ *   - Only the boot CPU (MPIDR Aff2-0 == 0, which SweetCPU::startAll requires to be
++ *     logical CPU 0) runs the idle publish, the probes and the hang deadline in
++ *     lilac_idle_wait and the stage-62 WFE hooks; other CPUs idle with plain WFI.
++ *   - The first CPU to start a reset delay owns it (lilac_reset_claim); any other CPU
++ *     that reaches a reset path parks with IRQ/FIQ masked. After a claim only the owner
++ *     changes lilac_wd_word, so the watchdog sees the delay that will actually run.
++ *   - lilac_wd_word is updated with an LL/SC compare-exchange: the stage/flag half and the
++ *     beat half never tear, and LILAC_WD_FATAL, once set, is never cleared.
 + */
 +#include <arm64/sweet_early.h>
 +
@@ -3608,14 +3636,54 @@ index 0000000..557b23e
 +#define LILAC_WD_IDLE           0x20000ull
 +/* Read by the loader's watchdog CPU with its MMU off: keep it alone in its cache line. */
 +__attribute__((used, aligned(128))) volatile uint64_t lilac_wd_word;
-+static uint64_t lilac_wd_beat;
 +static volatile int lilac_wd_latched;
++/* 0: no reset delay running; else LILAC_OWNER_VALID | MPIDR Aff2-0 of the CPU running it. */
++static uint64_t lilac_reset_owner;
++#define LILAC_OWNER_VALID       (1ull << 63)
++
++static inline uint64_t
++lilac_mpidr_aff(void)
++{
++	return __builtin_arm_rsr64("MPIDR_EL1") & 0xffffffull;
++}
++
++/* The boot CPU: MPIDR 0 (/cpus/cpu0 "running", loader G2; checked by SweetCPU::startAll). */
++static inline int
++lilac_is_boot_cpu(void)
++{
++	return lilac_mpidr_aff() == 0;
++}
++
++/*
++ * Atomically replace the stage/flag half (beat = 0) or add one to the beat half (beat = 1)
++ * of lilac_wd_word. FATAL is sticky; once a reset delay is claimed only its owner writes.
++ */
++static void
++lilac_wd_update(uint64_t v, int beat)
++{
++	uint64_t owner = __atomic_load_n(&lilac_reset_owner, __ATOMIC_ACQUIRE);
++	if (owner != 0 && owner != (LILAC_OWNER_VALID | lilac_mpidr_aff())) {
++		return;
++	}
++	uint64_t old = __atomic_load_n(&lilac_wd_word, __ATOMIC_RELAXED), nv;
++	do {
++		if (old & LILAC_WD_FATAL) {
++			if (beat || !(v & LILAC_WD_FATAL)) {
++				return;
++			}
++		}
++		if (beat && lilac_wd_latched) {
++			return;
++		}
++		nv = beat ? old + (1ull << 32) : ((old & ~0xffffffffull) | (v & 0xffffffffull));
++	} while (!__atomic_compare_exchange_n(&lilac_wd_word, &old, nv, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
++	__asm__ volatile ("dc civac, %0\n\tdsb sy" :: "r"(&lilac_wd_word) : "memory");
++}
 +
 +static void
 +lilac_wd_publish(uint64_t v)
 +{
-+	lilac_wd_word = (v & 0xffffffffull) | (lilac_wd_beat << 32);
-+	__asm__ volatile ("dc civac, %0\n\tdsb sy" :: "r"(&lilac_wd_word) : "memory");
++	lilac_wd_update(v, 0);
 +}
 +
 +static uint64_t
@@ -3629,17 +3697,40 @@ index 0000000..557b23e
 +/* Run once at the start of a reset delay, inside it (lilac_sd.c SD log flush). */
 +void (*volatile lilac_reset_hook)(uint32_t budget_secs);
 +
++/*
++ * One reset delay per boot: the first CPU to get here owns it (re-entry on the owner CPU,
++ * e.g. a panic inside the hook, proceeds as on one CPU). Any other CPU parks for good with
++ * IRQ/FIQ masked, so the reset time encodes the first event only.
++ */
++static void
++lilac_reset_claim(void)
++{
++	uint64_t me = LILAC_OWNER_VALID | lilac_mpidr_aff(), expected = 0;
++	if (__atomic_compare_exchange_n(&lilac_reset_owner, &expected, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ||
++	    expected == me) {
++		return;
++	}
++	__asm__ volatile ("msr DAIFSet, #3" ::: "memory");
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
 +/* Returns only if PSCI SYSTEM_RESET returns. */
 +static void
 +lilac_reset_after(uint64_t secs)
 +{
 +	uint64_t freq;
++	lilac_reset_claim();
 +	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(freq));
 +	uint64_t end = lilac_counter() + secs * freq;
 +	lilac_wd_latched = 1;
-+	void (*hook)(uint32_t) = lilac_reset_hook;
-+	if (hook != 0 && secs > 4) {
-+		lilac_reset_hook = 0;
++	void (*hook)(uint32_t) = __atomic_exchange_n(&lilac_reset_hook, (void (*)(uint32_t))0, __ATOMIC_ACQ_REL);
++	if (hook != 0 && secs <= 4) {
++		lilac_reset_hook = hook;        /* not run: leave it for a later, longer delay (as before) */
++		hook = 0;
++	}
++	if (hook != 0) {
 +		hook((uint32_t)secs - 4);
 +	}
 +	while (lilac_counter() < end) {
@@ -3743,6 +3834,10 @@ index 0000000..557b23e
 +void
 +lilac_idle_wait(void)
 +{
++	if (!lilac_is_boot_cpu()) {
++		__builtin_arm_wfi();            /* secondary CPUs: the normal idle path (cpu_idle) */
++		return;
++	}
 +	lilac_wd_publish(lilac_last_stage | LILAC_WD_IDLE);
 +	while ((__builtin_arm_rsr64("ISR_EL1") & ISR_EL1_IRQ_FIQ) == 0) {
 +		lilac_idle_checks();
@@ -3756,6 +3851,9 @@ index 0000000..557b23e
 +void
 +lilac_wfe_enter(void)
 +{
++	if (!lilac_is_boot_cpu()) {
++		return;
++	}
 +	lilac_wd_publish(LILAC_WFE_STAGE);
 +	lilac_event(LILAC_WFE_STAGE);
 +}
@@ -3763,41 +3861,48 @@ index 0000000..557b23e
 +void
 +lilac_wfe_poll(void)
 +{
++	if (!lilac_is_boot_cpu()) {
++		return;
++	}
 +	lilac_idle_checks();
 +}
 +
 +void
 +lilac_wfe_exit(void)
 +{
++	if (!lilac_is_boot_cpu()) {
++		return;
++	}
 +	lilac_wd_publish(lilac_last_stage);
 +}
 +
 +void
 +lilac_fatal_reset(void)
 +{
++	lilac_reset_claim();            /* another CPU's delay already runs: park here */
 +	lilac_wd_latched = 1;           /* before the publish: no beat may clear FATAL */
 +	lilac_wd_publish(lilac_last_stage | LILAC_WD_FATAL);
 +	lilac_reset_after(LILAC_FATAL_BASE + LILAC_FATAL_STEP * (uint64_t)lilac_last_stage);
 +}
-+/* Thread context, once per second (lilac_hb.c). IRQ/FIQ masked so idle and fatal publishes cannot interleave. */
++/*
++ * Thread context, once per second (lilac_hb.c), on any CPU. IRQ/FIQ masked so this CPU's idle
++ * and fatal publishes cannot interleave; other CPUs are excluded by the compare-exchange.
++ */
 +void
 +lilac_heartbeat(void)
 +{
 +	uint64_t daif = __builtin_arm_rsr64("DAIF");
 +	__asm__ volatile ("msr DAIFSet, #3" ::: "memory");
-+	if (!lilac_wd_latched) {
-+		lilac_wd_beat++;
-+		lilac_wd_publish(lilac_wd_word);
-+	}
++	lilac_wd_update(0, 1);
 +	__builtin_arm_wsr64("DAIF", daif);
 +}
 +#endif /* LILAC */
 diff --git a/osfmk/arm64/lilac_hb.c b/osfmk/arm64/lilac_hb.c
 new file mode 100644
-index 0000000..4bb812b
+index 0000000..a37e773
 --- /dev/null
 +++ b/osfmk/arm64/lilac_hb.c
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,198 @@
 +/*
 + * LILAC: watchdog heartbeat and timer-interrupt PC sampler.
 + *
@@ -3810,7 +3915,11 @@ index 0000000..4bb812b
 + * counted as idle, user or kernel; kernel samples are binned by (pc, pid). Every
 + * HB_REPORT_SECS the thread prints the busiest bins to the console (and so to the SD
 + * log) as unslid addresses, to be symbolicated against the CI kernel.development.
-+ * Single CPU (cpus=1): the table is only touched with interrupts masked.
++ * SMP: the per-CPU counters and the bin table are only touched with interrupts masked and
++ * hb_lock held (the sampler runs in IRQ context on every CPU, the report on the HB thread's
++ * CPU). Kernel bins are keyed by (pc, pid, cpu). The totals line keeps its format
++ * (tools/prof-sym.py); with more than one CPU, per-CPU lines "LILAC PROF cpuN: ..." follow
++ * it and bin lines end in " cpu N" (prof-sym.py's regexes still match / skip them).
 + */
 +#include <pexpert/arm64/board_config.h>
 +
@@ -3824,6 +3933,9 @@ index 0000000..4bb812b
 +#include <kern/sched.h>
 +#include <kern/sched_prim.h>
 +#include <kern/misc_protos.h>
++#include <kern/locks.h>
++#include <kern/cpu_number.h>
++#include <arm/cpu_internal.h>
 +#include <machine/machine_routines.h>
 +#include <arm64/proc_reg.h>
 +#include <arm64/sweet_early.h>
@@ -3838,10 +3950,18 @@ index 0000000..4bb812b
 +	uint64_t lr;            /* of the latest sample in this bin */
 +	uint32_t n;
 +	int32_t  pid;
++	uint32_t cpu;
 +};
 +
++struct hb_cpu_cnt {
++	uint32_t user, kern, idle;
++};
++
++static LCK_GRP_DECLARE(hb_lck_grp, "lilac_hb");
++static LCK_SPIN_DECLARE(hb_lock, &hb_lck_grp);
 +static struct hb_slot hb_tab[HB_SLOTS];
-+static uint32_t hb_user, hb_kern, hb_idle, hb_drop;
++static struct hb_cpu_cnt hb_cnt[MAX_CPUS];
++static uint32_t hb_drop;
 +static volatile int hb_on;
 +static int hb_wait_chan;
 +
@@ -3855,50 +3975,78 @@ index 0000000..4bb812b
 +		return;
 +	}
 +	thread_t th = current_thread();
++	uint32_t cpu = (uint32_t)cpu_number();
++	if (cpu >= MAX_CPUS) {
++		return;
++	}
 +	if (th == current_processor()->idle_thread) {
-+		hb_idle++;
++		lck_spin_lock(&hb_lock);
++		hb_cnt[cpu].idle++;
++		lck_spin_unlock(&hb_lock);
 +		return;
 +	}
 +	if (!PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
-+		hb_user++;
++		lck_spin_lock(&hb_lock);
++		hb_cnt[cpu].user++;
++		lck_spin_unlock(&hb_lock);
 +		return;
 +	}
-+	hb_kern++;
-+	uint64_t pc = get_saved_state_pc(state);
++	uint64_t pc = get_saved_state_pc(state), lr = get_saved_state_lr(state);
 +	task_t task = get_threadtask(th);
 +	int32_t pid = task ? task_pid(task) : -1;
-+	uint32_t h = (uint32_t)((pc >> 2) ^ (uint32_t)pid) % HB_SLOTS;
++	uint32_t h = (uint32_t)((pc >> 2) ^ (uint32_t)pid ^ (cpu * 0x9E3779B1u)) % HB_SLOTS;
++	lck_spin_lock(&hb_lock);
++	hb_cnt[cpu].kern++;
 +	for (uint32_t i = 0; i < HB_PROBE; i++) {
 +		struct hb_slot *s = &hb_tab[(h + i) % HB_SLOTS];
 +		if (s->n == 0) {
 +			s->pc = pc;
 +			s->pid = pid;
++			s->cpu = cpu;
 +		}
-+		if (s->pc == pc && s->pid == pid) {
++		if (s->pc == pc && s->pid == pid && s->cpu == cpu) {
 +			s->n++;
-+			s->lr = get_saved_state_lr(state);
++			s->lr = lr;
++			lck_spin_unlock(&hb_lock);
 +			return;
 +		}
 +	}
 +	hb_drop++;
++	lck_spin_unlock(&hb_lock);
 +}
 +
 +static void
 +hb_report(uint32_t secs)
 +{
 +	static struct hb_slot snap[HB_SLOTS];
-+	uint32_t user, kern, idle, drop;
++	static struct hb_cpu_cnt cnt[MAX_CPUS];
++	uint32_t user = 0, kern = 0, idle = 0, drop;
 +
 +	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	lck_spin_lock(&hb_lock);
 +	for (uint32_t i = 0; i < HB_SLOTS; i++) {
 +		snap[i] = hb_tab[i];
 +		hb_tab[i].n = 0;
 +	}
-+	user = hb_user; kern = hb_kern; idle = hb_idle; drop = hb_drop;
-+	hb_user = hb_kern = hb_idle = hb_drop = 0;
++	for (uint32_t c = 0; c < MAX_CPUS; c++) {
++		cnt[c] = hb_cnt[c];
++		hb_cnt[c] = (struct hb_cpu_cnt){ 0, 0, 0 };
++	}
++	drop = hb_drop;
++	hb_drop = 0;
++	lck_spin_unlock(&hb_lock);
 +	ml_set_interrupts_enabled(istate);
 +
++	for (uint32_t c = 0; c < MAX_CPUS; c++) {
++		user += cnt[c].user; kern += cnt[c].kern; idle += cnt[c].idle;
++	}
++	const int smp = real_ncpus > 1;
 +	printf("LILAC PROF t+%us: idle %u user %u kern %u (unbinned %u)\n", secs, idle, user, kern, drop);
++	for (uint32_t c = 0; smp && c < MAX_CPUS; c++) {
++		if (cnt[c].idle | cnt[c].user | cnt[c].kern) {
++			printf("LILAC PROF cpu%u: idle %u user %u kern %u\n", c, cnt[c].idle, cnt[c].user, cnt[c].kern);
++		}
++	}
 +	for (uint32_t k = 0; k < HB_TOP; k++) {
 +		uint32_t best = HB_SLOTS;
 +		for (uint32_t i = 0; i < HB_SLOTS; i++) {
@@ -3909,9 +4057,15 @@ index 0000000..4bb812b
 +		if (best == HB_SLOTS) {
 +			break;
 +		}
-+		printf("LILAC PROF  %u pid %d pc 0x%lx lr 0x%lx\n", snap[best].n, snap[best].pid,
-+		    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].pc),
-+		    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].lr));
++		if (smp) {
++			printf("LILAC PROF  %u pid %d pc 0x%lx lr 0x%lx cpu %u\n", snap[best].n, snap[best].pid,
++			    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].pc),
++			    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].lr), snap[best].cpu);
++		} else {
++			printf("LILAC PROF  %u pid %d pc 0x%lx lr 0x%lx\n", snap[best].n, snap[best].pid,
++			    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].pc),
++			    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].lr));
++		}
 +		snap[best].n = 0;
 +	}
 +	extern void lilac_sd_report(void);
