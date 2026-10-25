@@ -1845,7 +1845,7 @@ index 6b926fe..55a4cf5 100644
  		int error = sweet_ufs_init();
  		if (error) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..7835ff0 100644
+index bb2a2bf..7bc6b95 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -164,6 +164,11 @@
@@ -1860,7 +1860,7 @@ index bb2a2bf..7835ff0 100644
  #include <sys/kern_overrides.h>         /* for init_system_override() */
  #include <sys/lockf.h>                  /* for lf_init() */
  #include <sys/fsctl.h>
-@@ -685,7 +690,38 @@ bsd_init(void)
+@@ -685,7 +690,43 @@ bsd_init(void)
  	 * Initialize the calendar.
  	 */
  	bsd_init_kprintf("calling IOKitInitializeTime\n");
@@ -1881,6 +1881,11 @@ index bb2a2bf..7835ff0 100644
 +		lilac_sd_log_init();
 +	}
 +	{
++		/* Watchdog heartbeat and timer PC sampler (osfmk/arm64/lilac_hb.c), after the SD log so reports reach it. */
++		extern void lilac_hb_start(void);
++		lilac_hb_start();
++	}
++	{
 +		/* Stages 65-67: read-only microSD probe (bsd/dev/lilac_sd.c). */
 +		extern void lilac_sd_probe(void);
 +		lilac_sd_probe();
@@ -1899,7 +1904,7 @@ index bb2a2bf..7835ff0 100644
  
  	/* Initialize the file systems. */
  	bsd_init_kprintf("calling vfsinit\n");
-@@ -874,11 +910,13 @@ bsd_init(void)
+@@ -874,11 +915,13 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling setconf\n");
  		setconf();
@@ -1913,7 +1918,7 @@ index bb2a2bf..7835ff0 100644
  		if (0 == (err = vfs_mountroot())) {
  			break;
  		}
-@@ -1098,6 +1136,7 @@ bsdinit_task(void)
+@@ -1098,6 +1141,7 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
@@ -2551,10 +2556,10 @@ index b082a10..510b0fd 100644
  #endif
 diff --git a/osfmk/arm64/lilac_diag.c b/osfmk/arm64/lilac_diag.c
 new file mode 100644
-index 0000000..1af50cf
+index 0000000..557b23e
 --- /dev/null
 +++ b/osfmk/arm64/lilac_diag.c
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,242 @@
 +/*
 + * LILAC (Sony Xperia XZ1 Compact, MSM8998) boot-progress channel.
 + *
@@ -2577,6 +2582,12 @@ index 0000000..1af50cf
 + *                 stage, so busy or interrupts-masked hangs recover too (stage 22: 192 s,
 + *                 52: 372 s; below the panic delay 90 + 15 * stage >= 420 s for stage >= 22).
 + *                 A set flag defers to the paths above; the loader caps the run at 1000 s.
++ *                 Bits 32-63 carry a beat counter (the stub uses only bits 0-17 for the
++ *                 stage and flags): lilac_heartbeat(), called each second by a kernel thread
++ *                 (lilac_hb.c), changes the word, so the stub fires only when that thread
++ *                 can no longer run (deadlocked with interrupts or preemption off, or
++ *                 starved). The idle-hang budget above is unchanged and still ends a live
++ *                 run with an SD log flush. Beats stop once any reset delay has started.
 + *   stages 39-52  finer marks between kernel_bootstrap (22) and bsd_init (24), startup.c
 + *   stages 53-61  after PE_lockdown_iokit: pe_init.c, startup.c, SweetCPU.cpp
 + *   stages 70-74  pe_init_fiq GIC/timer probes (lilac_report): only when lilac_stop selects
@@ -2607,11 +2618,13 @@ index 0000000..1af50cf
 +#define LILAC_WD_IDLE           0x20000ull
 +/* Read by the loader's watchdog CPU with its MMU off: keep it alone in its cache line. */
 +__attribute__((used, aligned(128))) volatile uint64_t lilac_wd_word;
++static uint64_t lilac_wd_beat;
++static volatile int lilac_wd_latched;
 +
 +static void
 +lilac_wd_publish(uint64_t v)
 +{
-+	lilac_wd_word = v;
++	lilac_wd_word = (v & 0xffffffffull) | (lilac_wd_beat << 32);
 +	__asm__ volatile ("dc civac, %0\n\tdsb sy" :: "r"(&lilac_wd_word) : "memory");
 +}
 +
@@ -2633,6 +2646,7 @@ index 0000000..1af50cf
 +	uint64_t freq;
 +	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r"(freq));
 +	uint64_t end = lilac_counter() + secs * freq;
++	lilac_wd_latched = 1;
 +	void (*hook)(uint32_t) = lilac_reset_hook;
 +	if (hook != 0 && secs > 4) {
 +		lilac_reset_hook = 0;
@@ -2771,8 +2785,174 @@ index 0000000..1af50cf
 +void
 +lilac_fatal_reset(void)
 +{
++	lilac_wd_latched = 1;           /* before the publish: no beat may clear FATAL */
 +	lilac_wd_publish(lilac_last_stage | LILAC_WD_FATAL);
 +	lilac_reset_after(LILAC_FATAL_BASE + LILAC_FATAL_STEP * (uint64_t)lilac_last_stage);
++}
++/* Thread context, once per second (lilac_hb.c). IRQ/FIQ masked so idle and fatal publishes cannot interleave. */
++void
++lilac_heartbeat(void)
++{
++	uint64_t daif = __builtin_arm_rsr64("DAIF");
++	__asm__ volatile ("msr DAIFSet, #3" ::: "memory");
++	if (!lilac_wd_latched) {
++		lilac_wd_beat++;
++		lilac_wd_publish(lilac_wd_word);
++	}
++	__builtin_arm_wsr64("DAIF", daif);
++}
++#endif /* LILAC */
+diff --git a/osfmk/arm64/lilac_hb.c b/osfmk/arm64/lilac_hb.c
+new file mode 100644
+index 0000000..ea8b06c
+--- /dev/null
++++ b/osfmk/arm64/lilac_hb.c
+@@ -0,0 +1,147 @@
++/*
++ * LILAC: watchdog heartbeat and timer-interrupt PC sampler.
++ *
++ * Heartbeat: a kernel thread at MAXPRI_KERNEL calls lilac_heartbeat() (lilac_diag.c) every
++ * second, so the G8 watchdog CPU sees lilac_wd_word change while the kernel can still
++ * schedule, and resets only on real hangs. Started from bsd_init after the SD log.
++ *
++ * Sampler: sleh_irq calls lilac_pc_sample() for every virtual-timer IRQ (quantum and
++ * timer deadlines, so a CPU-bound thread is sampled about every 10 ms). Samples are
++ * counted as idle, user or kernel; kernel samples are binned by (pc, pid). Every
++ * HB_REPORT_SECS the thread prints the busiest bins to the console (and so to the SD
++ * log) as unslid addresses, to be symbolicated against the CI kernel.development.
++ * Single CPU (cpus=1): the table is only touched with interrupts masked.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(LILAC)
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/processor.h>
++#include <kern/sched.h>
++#include <kern/sched_prim.h>
++#include <kern/misc_protos.h>
++#include <machine/machine_routines.h>
++#include <arm64/proc_reg.h>
++#include <arm64/sweet_early.h>
++
++#define HB_SLOTS        64u
++#define HB_PROBE        8u
++#define HB_TOP          8u
++#define HB_REPORT_SECS  20u
++
++struct hb_slot {
++	uint64_t pc;
++	uint64_t lr;            /* of the latest sample in this bin */
++	uint32_t n;
++	int32_t  pid;
++};
++
++static struct hb_slot hb_tab[HB_SLOTS];
++static uint32_t hb_user, hb_kern, hb_idle, hb_drop;
++static volatile int hb_on;
++static int hb_wait_chan;
++
++void lilac_pc_sample(arm_saved_state_t *state);
++
++/* Timer IRQ context, interrupts masked. */
++void
++lilac_pc_sample(arm_saved_state_t *state)
++{
++	if (!hb_on) {
++		return;
++	}
++	thread_t th = current_thread();
++	if (th == current_processor()->idle_thread) {
++		hb_idle++;
++		return;
++	}
++	if (!PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
++		hb_user++;
++		return;
++	}
++	hb_kern++;
++	uint64_t pc = get_saved_state_pc(state);
++	task_t task = get_threadtask(th);
++	int32_t pid = task ? task_pid(task) : -1;
++	uint32_t h = (uint32_t)((pc >> 2) ^ (uint32_t)pid) % HB_SLOTS;
++	for (uint32_t i = 0; i < HB_PROBE; i++) {
++		struct hb_slot *s = &hb_tab[(h + i) % HB_SLOTS];
++		if (s->n == 0) {
++			s->pc = pc;
++			s->pid = pid;
++		}
++		if (s->pc == pc && s->pid == pid) {
++			s->n++;
++			s->lr = get_saved_state_lr(state);
++			return;
++		}
++	}
++	hb_drop++;
++}
++
++static void
++hb_report(uint32_t secs)
++{
++	static struct hb_slot snap[HB_SLOTS];
++	uint32_t user, kern, idle, drop;
++
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	for (uint32_t i = 0; i < HB_SLOTS; i++) {
++		snap[i] = hb_tab[i];
++		hb_tab[i].n = 0;
++	}
++	user = hb_user; kern = hb_kern; idle = hb_idle; drop = hb_drop;
++	hb_user = hb_kern = hb_idle = hb_drop = 0;
++	ml_set_interrupts_enabled(istate);
++
++	printf("LILAC PROF t+%us: idle %u user %u kern %u (unbinned %u)\n", secs, idle, user, kern, drop);
++	for (uint32_t k = 0; k < HB_TOP; k++) {
++		uint32_t best = HB_SLOTS;
++		for (uint32_t i = 0; i < HB_SLOTS; i++) {
++			if (snap[i].n != 0 && (best == HB_SLOTS || snap[i].n > snap[best].n)) {
++				best = i;
++			}
++		}
++		if (best == HB_SLOTS) {
++			break;
++		}
++		printf("LILAC PROF  %u pid %d pc 0x%lx lr 0x%lx\n", snap[best].n, snap[best].pid,
++		    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].pc),
++		    (unsigned long)VM_KERNEL_UNSLIDE(snap[best].lr));
++		snap[best].n = 0;
++	}
++}
++
++static void
++lilac_hb_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t secs = 0;
++	for (;;) {
++		lilac_heartbeat();
++		if (++secs % HB_REPORT_SECS == 0) {
++			hb_report(secs);
++		}
++		assert_wait_timeout((event_t)&hb_wait_chan, THREAD_UNINT, 1000, (uint32_t)NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++void lilac_hb_start(void);
++
++void
++lilac_hb_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start_priority(lilac_hb_thread, NULL, MAXPRI_KERNEL, &thread) != KERN_SUCCESS) {
++		printf("LILAC HB: thread start failed\n");
++		return;
++	}
++	thread_deallocate(thread);
++	hb_on = 1;
++	printf("LILAC HB: watchdog heartbeat 1 s, PC sampler report every %u s\n", HB_REPORT_SECS);
 +}
 +#endif /* LILAC */
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
@@ -2815,7 +2995,7 @@ index a1f2a91..41f1342 100644
  		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
  		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 24f1abc..6d74bdb 100644
+index 24f1abc..90cc6ee 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -84,6 +84,7 @@
@@ -2836,12 +3016,16 @@ index 24f1abc..6d74bdb 100644
  	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
  	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
  
-@@ -1868,6 +1872,9 @@ sleh_irq(arm_saved_state_t *state)
+@@ -1868,6 +1872,13 @@ sleh_irq(arm_saved_state_t *state)
  		return; /* spurious */
  	}
  	if (intid == sweet_vtimer_intid) {
 +#if defined(LILAC)
 +		lilac_event(28);        /* first virtual-timer IRQ taken */
++		{
++			extern void lilac_pc_sample(arm_saved_state_t *state);
++			lilac_pc_sample(state);     /* lilac_hb.c: where the CPU was when the timer fired */
++		}
 +#endif
  		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
  		cdp->cpu_decrementer = -1; /* Large */
@@ -2998,10 +3182,10 @@ index 6928957..44a87a1 100644
  #include <kern/misc_protos.h>
  
 diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
-index d7a25f2..d5201a9 100644
+index d7a25f2..8cf3db0 100644
 --- a/osfmk/arm64/sweet_early.h
 +++ b/osfmk/arm64/sweet_early.h
-@@ -6,12 +6,39 @@
+@@ -6,12 +6,40 @@
  #include <stdarg.h>
  #include <stdint.h>
  
@@ -3031,6 +3215,7 @@ index d7a25f2..d5201a9 100644
 +void lilac_wfe_poll(void);
 +void lilac_wfe_exit(void);
 +void lilac_fatal_reset(void);
++void lilac_heartbeat(void);
 +extern void (*volatile lilac_reset_hook)(uint32_t budget_secs);
 +extern volatile uint64_t lilac_wd_word;  /* watchdog mailbox, see lilac_diag.c */
 +static inline void sweet_early_mark(unsigned int stage, const char *label)
@@ -3042,7 +3227,7 @@ index d7a25f2..d5201a9 100644
  #else
  static inline void sweet_early_mark(unsigned int stage, const char *label)
  {
-@@ -21,4 +48,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -21,4 +49,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
  static inline void sweet_early_disable(void) {}
  #endif
  
@@ -3052,14 +3237,15 @@ index d7a25f2..d5201a9 100644
 +
  #endif
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index b0dad49..05530f8 100644
+index b0dad49..0401dd6 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
-@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+@@ -41,6 +41,8 @@ osfmk/arm/arm_timer.c		standard
  osfmk/arm/arm_init.c	optional config_pmap_ppl
  osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
  osfmk/arm64/sweet_early.c	standard
 +osfmk/arm64/lilac_diag.c	standard
++osfmk/arm64/lilac_hb.c	standard
  osfmk/arm64/arm64_hypercall.c	standard
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
