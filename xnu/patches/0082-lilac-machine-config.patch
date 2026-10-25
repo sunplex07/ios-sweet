@@ -2143,6 +2143,24 @@ index da0bbba..87867be 100644
  	cbz		w10, Ltrylock_dequeue_success
  
  	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..0247c23 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10891,7 +10891,12 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 	vm_map_address_t commpage_text_va = 0;
+ 
+ 	do {
+-		int text_leaf_index = random() % num_ptes;
++		/*
++		 * Pick a VM-page-aligned slot: with 16KB VM pages on a 4KB granule
++		 * (PAGE_RATIO 4) each mapping spans PAGE_RATIO leaf PTEs and
++		 * write_pte_fast() panics on a PTE pointer that is not aligned to them.
++		 */
++		int text_leaf_index = (random() % (num_ptes / PAGE_RATIO)) * PAGE_RATIO;
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index 06bb568..987bc88 100644
 --- a/osfmk/arm64/arm_vm_init.c
